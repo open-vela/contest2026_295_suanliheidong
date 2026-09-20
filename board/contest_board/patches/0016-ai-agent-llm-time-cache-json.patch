@@ -1,0 +1,844 @@
+diff --git a/include/llm/llm_cache.h b/include/llm/llm_cache.h
+index b4435cf..a3f0012 100644
+--- a/include/llm/llm_cache.h
++++ b/include/llm/llm_cache.h
+@@ -82,6 +82,9 @@ uint32_t llm_cache_hit_count(void);
+  */
+ void llm_cache_cleanup(void);
+ 
++/* Invalidate all cached responses after backend configuration changes. */
++void llm_cache_invalidate(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/core/agent_loop.c b/src/core/agent_loop.c
+index 2933a4e..e4012b8 100644
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -252,7 +252,17 @@ int agent_loop_bisect_heap_hold(size_t size)
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+ static char* handle_slash_remind(const agent_msg_t* msg);
+-static bool llm_call_timed_out(uint32_t latency_ms);
++static bool llm_call_timed_out(uint64_t latency_ms);
++
++static bool llm_watchdog_expired(uint64_t latency_ms, int err)
++{
++    if (!llm_call_timed_out(latency_ms)) {
++        return false;
++    }
++
++    /* HTTP errors are classified by status, never as watchdog timeouts. */
++    return err == OK || llm_proxy_diag_last_status() == 0;
++}
+ 
+ static int agent_loop_llm_chat_tools(const char *system_prompt,
+     cJSON *messages, const char *tools_json, llm_response_t *resp)
+@@ -282,29 +292,21 @@ static int agent_loop_llm_chat_tools(const char *system_prompt,
+ 
+ /* ── Clock-safe elapsed time calculation ───────────────────── */
+ 
+-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
+-    const struct timeval* t1)
++static inline uint64_t monotonic_ms(void)
+ {
+-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
+-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
++    struct timespec ts;
+ 
+-    /* Clock went backwards (NTP jump, manual adjustment) */
+-    if (sec_diff < 0) {
+-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+         return 0;
+     }
+ 
+-    /* Microsecond borrow */
+-    if (usec_diff < 0) {
+-        sec_diff--;
+-        usec_diff += 1000000;
+-    }
+-
+-    if (sec_diff < 0) {
+-        return 0;
+-    }
++    return (uint64_t)ts.tv_sec * 1000ULL
++        + (uint64_t)ts.tv_nsec / 1000000ULL;
++}
+ 
+-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
++static inline uint64_t monotonic_elapsed_ms(uint64_t start, uint64_t end)
++{
++    return start != 0 && end != 0 && end >= start ? end - start : 0;
+ }
+ 
+ /* ── Memory pool (pre-allocated tool output buffers) ───────── */
+@@ -1034,12 +1036,11 @@ static char* force_finish_reply(const char* system_prompt,
+ 
+     llm_response_t resp;
+     char* result = NULL;
+-    struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    uint64_t t0 = monotonic_ms();
+     int err = agent_loop_llm_chat_tools(system_prompt, messages, NULL, &resp);
+-    gettimeofday(&t1, NULL);
+-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
+-    bool timed_out = llm_call_timed_out(ms);
++    uint64_t t1 = monotonic_ms();
++    uint64_t ms = monotonic_elapsed_ms(t0, t1);
++    bool timed_out = llm_watchdog_expired(ms, err);
+ 
+     if (err == OK && !timed_out && resp.text && resp.text_len > 0) {
+         result = strdup(resp.text);
+@@ -1185,9 +1186,9 @@ static bool check_tool_dup(const llm_response_t* resp,
+ 
+ /* Check if an LLM call exceeded the watchdog timeout.
+  * Returns true when latency_ms exceeds AGENT_LLM_TIMEOUT_SEC. */
+-static bool llm_call_timed_out(uint32_t latency_ms)
++static bool llm_call_timed_out(uint64_t latency_ms)
+ {
+-    return latency_ms > (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000;
++    return latency_ms > (uint64_t)AGENT_LLM_TIMEOUT_SEC * 1000ULL;
+ }
+ 
+ /* Handle TASK_COMPLETE: inject hint and do one final LLM call.
+@@ -1206,12 +1207,11 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
+ 
+     llm_response_t final_resp;
+     char* result = NULL;
+-    struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    uint64_t t0 = monotonic_ms();
+     int err = agent_loop_llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+-    gettimeofday(&t1, NULL);
+-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
+-    bool timed_out = llm_call_timed_out(ms);
++    uint64_t t1 = monotonic_ms();
++    uint64_t ms = monotonic_elapsed_ms(t0, t1);
++    bool timed_out = llm_watchdog_expired(ms, err);
+ 
+     if (err == OK && !timed_out
+         && final_resp.text && final_resp.text_len > 0) {
+@@ -1246,6 +1246,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+     name_repeat = 0;
+     int last_total_tokens = 0;
+     bool watchdog_fired = false;
++    bool cacheable = false;
+ 
+     /* Router: select and apply best backend before first LLM call.
+      * Estimate complexity from the last user message. */
+@@ -1268,7 +1269,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+     if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
+         char* cached = llm_cache_get(msg->content, strlen(msg->content));
+         if (cached) {
+-            syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
++            syslog(LOG_INFO,
++                "[%s] Cache hit (successful answer), skipping LLM call\n",
++                TAG);
+             final_text = cached;
+             agent_trace_step(&trace, 0, NULL, 0, 1);
+             agent_trace_end(&trace, AGENT_TRACE_OK);
+@@ -1281,11 +1284,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         send_working_status(msg, iteration);
+ 
+         llm_response_t resp;
+-        struct timeval tv_start, tv_end;
+-        gettimeofday(&tv_start, NULL);
++        uint64_t tv_start = monotonic_ms();
+         int err = agent_loop_llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+-        gettimeofday(&tv_end, NULL);
+-        uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++        uint64_t tv_end = monotonic_ms();
++        uint64_t latency_ms = monotonic_elapsed_ms(tv_start, tv_end);
+ 
+         /* Router failover: on LLM call failure, try next backend */
+         if (err != OK && router_idx >= 0) {
+@@ -1300,19 +1302,19 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 router_idx = next_idx;
+                 trace.backend_idx = next_idx;
+                 llm_response_free(&resp);
+-                gettimeofday(&tv_start, NULL);
++                tv_start = monotonic_ms();
+                 err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                     tools_json, &resp);
+-                gettimeofday(&tv_end, NULL);
+-                latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++                tv_end = monotonic_ms();
++                latency_ms = monotonic_elapsed_ms(tv_start, tv_end);
+             }
+         }
+ 
+         if (err != OK) {
+             /* Distinguish timeout-induced failure from other errors */
+-            if (llm_call_timed_out(latency_ms)) {
++            if (llm_watchdog_expired(latency_ms, err)) {
+                 syslog(LOG_WARNING,
+-                    "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
++                    "[%s] LLM watchdog: call failed after %" PRIu64 " ms "
+                     "(limit %ds)\n",
+                     TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+                 agent_trace_step(&trace, iteration, NULL,
+@@ -1334,9 +1336,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+          * The socket SO_RCVTIMEO may have fired and caused a partial
+          * or error response that llm_chat_tools mapped to ERROR above,
+          * but if the call barely completed, we still flag it. */
+-        if (llm_call_timed_out(latency_ms)) {
++        if (llm_watchdog_expired(latency_ms, err)) {
+             syslog(LOG_WARNING,
+-                "[%s] LLM watchdog: call took %" PRIu32 " ms (limit %ds), "
++                "[%s] LLM watchdog: call took %" PRIu64 " ms (limit %ds), "
+                 "treating as timeout\n",
+                 TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
+@@ -1349,7 +1351,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         /* Report success to router */
+         if (router_idx >= 0) {
+             llm_router_report_success(router_idx);
+-            llm_router_report_latency(router_idx, latency_ms);
++            llm_router_report_latency(router_idx,
++                latency_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)latency_ms);
+             if (resp.total_tokens > 0) {
+                 llm_router_report_tokens(router_idx,
+                     resp.prompt_tokens, resp.completion_tokens);
+@@ -1400,17 +1403,17 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                     router_idx = prem_idx;
+                     trace.backend_idx = prem_idx;
+ 
+-                    gettimeofday(&tv_start, NULL);
++                    tv_start = monotonic_ms();
+                     err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                         tools_json, &resp);
+-                    gettimeofday(&tv_end, NULL);
+-                    latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++                    tv_end = monotonic_ms();
++                    latency_ms = monotonic_elapsed_ms(tv_start, tv_end);
+ 
+                     /* Watchdog check on cascade retry */
+-                    if (llm_call_timed_out(latency_ms)) {
++                    if (llm_watchdog_expired(latency_ms, err)) {
+                         syslog(LOG_WARNING,
+                             "[%s] LLM watchdog: cascade retry "
+-                            "took %" PRIu32 " ms\n",
++                            "took %" PRIu64 " ms\n",
+                             TAG, latency_ms);
+                         free(fallback_text);
+                         fallback_text = NULL;
+@@ -1424,11 +1427,13 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+ 
+                     if (err == OK && resp.text && resp.text_len > 0) {
+                         final_text = strdup(resp.text);
++                        cacheable = final_text != NULL;
+                         free(fallback_text);
+                         fallback_text = NULL;
+                     } else {
+                         /* Premium failed — fall back to cheap response */
+                         final_text = fallback_text;
++                        cacheable = final_text != NULL;
+                         fallback_text = NULL;
+                     }
+                     agent_trace_step(&trace, iteration, NULL,
+@@ -1438,6 +1443,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 }
+                 /* No premium backend available — use cheap response */
+                 final_text = fallback_text;
++                cacheable = final_text != NULL;
+                 fallback_text = NULL;
+                 agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
+                 break;
+@@ -1445,6 +1451,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+ 
+             if (resp.text && resp.text_len > 0 && !final_text) {
+                 final_text = strdup(resp.text);
++                cacheable = final_text != NULL;
+             }
+             agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
+             llm_response_free(&resp);
+@@ -1541,6 +1548,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 &task_timed_out);
+             if (task_timed_out) {
+                 watchdog_fired = true;
++            } else {
++                cacheable = final_text != NULL;
+             }
+             break;
+         }
+@@ -1562,7 +1571,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+ 
+ send_reply:
+     /* Cache store: save simple query responses for future reuse */
+-    if (final_text && msg->content
++    if (cacheable && !watchdog_fired && final_text && msg->content
+         && complexity == LLM_COMPLEXITY_SIMPLE) {
+         llm_cache_put(msg->content, strlen(msg->content), final_text);
+         if (last_total_tokens > 0) {
+diff --git a/src/core/agent_trace.c b/src/core/agent_trace.c
+index 0083f18..b5951f8 100644
+--- a/src/core/agent_trace.c
++++ b/src/core/agent_trace.c
+@@ -17,13 +17,31 @@
+ #include "core/agent_trace.h"
+ 
+ #include <stdio.h>
++#include <inttypes.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/time.h>
++#include <time.h>
+ #include <syslog.h>
+ 
+ static const char* TAG = "trace";
+ 
++static uint64_t trace_monotonic_ms(void)
++{
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++        return 0;
++    }
++
++    return (uint64_t)ts.tv_sec * 1000ULL
++        + (uint64_t)ts.tv_nsec / 1000000ULL;
++}
++
++static uint64_t trace_elapsed_ms(uint64_t start, uint64_t end)
++{
++    return start != 0 && end != 0 && end >= start ? end - start : 0;
++}
++
+ static const char* status_str(int status)
+ {
+     switch (status) {
+@@ -43,15 +61,15 @@ static const char* status_str(int status)
+ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
+     const char* channel)
+ {
+-    struct timeval tv;
++    uint64_t mono_ms;
+ 
+     memset(t, 0, sizeof(*t));
+-    gettimeofday(&tv, NULL);
+-    t->start_ts = (uint32_t)tv.tv_sec;
++    mono_ms = trace_monotonic_ms();
++    t->start_mono_ms = mono_ms;
+ 
+     /* Generate run_id: lower 32 bits of time + rand for uniqueness */
+     snprintf(t->run_id, sizeof(t->run_id), "%08x%08x",
+-        (unsigned)(tv.tv_sec & 0xFFFFFFFF),
++        (unsigned)(mono_ms & 0xFFFFFFFF),
+         (unsigned)(rand() & 0xFFFFFFFF));
+ 
+     if (chat_id) {
+@@ -70,7 +88,7 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
+ }
+ 
+ void agent_trace_step(agent_trace_t* t, int iteration,
+-    const char* tool_name, uint32_t latency_ms,
++    const char* tool_name, uint64_t latency_ms,
+     int llm_ok)
+ {
+     t->iteration = iteration;
+@@ -80,28 +98,26 @@ void agent_trace_step(agent_trace_t* t, int iteration,
+     }
+ 
+     syslog(LOG_INFO,
+-        "[%s:%s] iter=%d tool=%s latency=%ums llm=%s backend=%d",
++        "[%s:%s] iter=%d tool=%s latency=%" PRIu64 "ms llm=%s backend=%d",
+         TAG, t->run_id, iteration,
+         (tool_name && tool_name[0]) ? tool_name : "(none)",
+-        (unsigned)latency_ms,
++        latency_ms,
+         llm_ok ? "ok" : "fail",
+         t->backend_idx);
+ }
+ 
+ void agent_trace_end(agent_trace_t* t, int status)
+ {
+-    struct timeval tv;
+-
+-    gettimeofday(&tv, NULL);
++    uint64_t end_mono_ms = trace_monotonic_ms();
+     t->status = status;
+ 
+-    uint32_t elapsed = (uint32_t)tv.tv_sec - t->start_ts;
++    uint64_t elapsed = trace_elapsed_ms(t->start_mono_ms, end_mono_ms);
+ 
+     syslog(LOG_INFO,
+         "[%s:%s] END status=%s iters=%d tools=%d "
+-        "llm_ms=%u elapsed=%us backend=%d",
++        "llm_ms=%" PRIu64 " elapsed=%" PRIu64 "ms backend=%d",
+         TAG, t->run_id, status_str(status),
+         t->iteration + 1, t->total_tool_calls,
+-        (unsigned)t->total_latency_ms, (unsigned)elapsed,
++        t->total_latency_ms, elapsed,
+         t->backend_idx);
+ }
+diff --git a/src/core/agent_trace.h b/src/core/agent_trace.h
+index f6434ba..d3aebec 100644
+--- a/src/core/agent_trace.h
++++ b/src/core/agent_trace.h
+@@ -46,10 +46,10 @@ typedef struct {
+     char run_id[17]; /* 16 hex chars + NUL */
+     char chat_id[64];
+     char channel[16];
+-    uint32_t start_ts; /* epoch seconds */
++    uint64_t start_mono_ms; /* monotonic milliseconds */
+     int iteration; /* current iteration number */
+     int backend_idx; /* current router backend index */
+-    uint32_t total_latency_ms; /* cumulative LLM latency */
++    uint64_t total_latency_ms; /* cumulative LLM latency */
+     int total_tool_calls; /* cumulative tool call count */
+     int status; /* AGENT_TRACE_* */
+ } agent_trace_t;
+@@ -64,7 +64,7 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
+  * Log one iteration step (after each LLM call + tool execution).
+  */
+ void agent_trace_step(agent_trace_t* t, int iteration,
+-    const char* tool_name, uint32_t latency_ms,
++    const char* tool_name, uint64_t latency_ms,
+     int llm_ok);
+ 
+ /**
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index 75fcfea..082c850 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -529,15 +529,24 @@ static int tls_write_request(tls_ctx_t* ctx,
+         ret = mbedtls_ssl_write(&ctx->ssl,
+             (const unsigned char*)(hdr + written),
+             (size_t)(pos - written));
+-        syslog(LOG_INFO, "[ASK-DIAG] http send ret=%d errno=%d\n", ret,
+-            errno);
+-        syslog(LOG_INFO, "[TLS-PROBE] send ret=%d errno=%d\n", ret, errno);
+         if (ret > 0) {
+             written += ret;
++            syslog(LOG_INFO,
++                "[ASK-DIAG] http send ret=%d sent=%d/%d\n",
++                ret, written, pos);
++            syslog(LOG_INFO,
++                "[TLS-PROBE] send ret=%d sent=%d/%d\n",
++                ret, written, pos);
+         } else if (ret == 0) {
++            syslog(LOG_INFO, "[ASK-DIAG] http send ret=0\n");
++            syslog(LOG_INFO, "[TLS-PROBE] send ret=0\n");
+             free(hdr);
+             return VELA_TLS_ERR_WRITE;
+         } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++            syslog(LOG_INFO,
++                "[ASK-DIAG] http send ret=%d errno=%d\n", ret, errno);
++            syslog(LOG_INFO,
++                "[TLS-PROBE] send ret=%d errno=%d\n", ret, errno);
+             free(hdr);
+             return VELA_TLS_ERR_WRITE;
+         }
+@@ -552,15 +561,23 @@ static int tls_write_request(tls_ctx_t* ctx,
+             ret = mbedtls_ssl_write(&ctx->ssl,
+                 (const unsigned char*)(body + bw),
+                 body_len - bw);
+-            syslog(LOG_INFO, "[ASK-DIAG] http send ret=%d errno=%d\n", ret,
+-                errno);
+-            syslog(LOG_INFO, "[TLS-PROBE] send ret=%d errno=%d\n", ret,
+-                errno);
+             if (ret > 0) {
+                 bw += (size_t)ret;
++                syslog(LOG_INFO,
++                    "[ASK-DIAG] http send ret=%d sent=%zu/%zu\n",
++                    ret, bw, body_len);
++                syslog(LOG_INFO,
++                    "[TLS-PROBE] send ret=%d sent=%zu/%zu\n",
++                    ret, bw, body_len);
+             } else if (ret == 0) {
++                syslog(LOG_INFO, "[ASK-DIAG] http send ret=0\n");
++                syslog(LOG_INFO, "[TLS-PROBE] send ret=0\n");
+                 return VELA_TLS_ERR_WRITE;
+             } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++                syslog(LOG_INFO,
++                    "[ASK-DIAG] http send ret=%d errno=%d\n", ret, errno);
++                syslog(LOG_INFO,
++                    "[TLS-PROBE] send ret=%d errno=%d\n", ret, errno);
+                 return VELA_TLS_ERR_WRITE;
+             }
+         }
+@@ -631,17 +648,24 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+         ret = mbedtls_ssl_read(&ctx->ssl,
+             (unsigned char*)(raw + raw_len),
+             TLS_RAW_BUF_SIZE - 1 - raw_len);
+-        syslog(LOG_INFO, "[ASK-DIAG] http recv ret=%d errno=%d\n", ret,
+-            errno);
+-        syslog(LOG_INFO, "[TLS-PROBE] recv ret=%d errno=%d\n", ret, errno);
+         if (ret > 0) {
+             raw_len += (size_t)ret;
++            syslog(LOG_INFO,
++                "[ASK-DIAG] http recv ret=%d bytes=%zu\n", ret, raw_len);
++            syslog(LOG_INFO,
++                "[TLS-PROBE] recv ret=%d bytes=%zu\n", ret, raw_len);
+             if (memmem(raw, raw_len, "\r\n\r\n", 4))
+                 break;
+         } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
++            syslog(LOG_INFO, "[ASK-DIAG] http recv ret=%d\n", ret);
++            syslog(LOG_INFO, "[TLS-PROBE] recv ret=%d\n", ret);
+             eof = 1;
+             break;
+         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
++            syslog(LOG_INFO,
++                "[ASK-DIAG] http recv ret=%d errno=%d\n", ret, errno);
++            syslog(LOG_INFO,
++                "[TLS-PROBE] recv ret=%d errno=%d\n", ret, errno);
+             syslog(LOG_ERR, "[%s] ssl_read (header) ret=0x%x\n", TAG, -ret);
+             tls_raw_release(raw);
+             return VELA_TLS_ERR_READ;
+@@ -715,15 +739,23 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+             ret = mbedtls_ssl_read(&ctx->ssl,
+                 (unsigned char*)(resp_buf + resp_pos),
+                 resp_cap - 1 - resp_pos);
+-            syslog(LOG_INFO, "[ASK-DIAG] http recv ret=%d errno=%d\n", ret,
+-                errno);
+-            syslog(LOG_INFO, "[TLS-PROBE] recv ret=%d errno=%d\n", ret,
+-                errno);
+             if (ret > 0) {
+                 resp_pos += (size_t)ret;
++                syslog(LOG_INFO,
++                    "[ASK-DIAG] http recv ret=%d bytes=%zu\n",
++                    ret, resp_pos);
++                syslog(LOG_INFO,
++                    "[TLS-PROBE] recv ret=%d bytes=%zu\n",
++                    ret, resp_pos);
+             } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
++                syslog(LOG_INFO, "[ASK-DIAG] http recv ret=%d\n", ret);
++                syslog(LOG_INFO, "[TLS-PROBE] recv ret=%d\n", ret);
+                 break;
+             } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
++                syslog(LOG_INFO,
++                    "[ASK-DIAG] http recv ret=%d errno=%d\n", ret, errno);
++                syslog(LOG_INFO,
++                    "[TLS-PROBE] recv ret=%d errno=%d\n", ret, errno);
+                 break;
+             }
+         }
+diff --git a/src/llm/llm_cache.c b/src/llm/llm_cache.c
+index 82741dd..bf6cd5f 100644
+--- a/src/llm/llm_cache.c
++++ b/src/llm/llm_cache.c
+@@ -28,7 +28,7 @@ static const char* TAG = "llm_cache";
+ typedef struct {
+     uint32_t hash;
+     char* response;
+-    uint32_t ts; /* epoch seconds when stored */
++    uint64_t ts_mono_ms;
+     uint32_t hits;
+     int tokens; /* total_tokens when cached */
+ } llm_cache_slot_t;
+@@ -38,6 +38,18 @@ static pthread_mutex_t s_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+ static uint32_t s_tokens_saved;
+ static uint32_t s_total_hits;
+ 
++static uint64_t cache_monotonic_ms(void)
++{
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++        return 0;
++    }
++
++    return (uint64_t)ts.tv_sec * 1000ULL
++        + (uint64_t)ts.tv_nsec / 1000000ULL;
++}
++
+ /* djb2 hash over first LLM_CACHE_KEY_LEN chars */
+ 
+ static uint32_t djb2_hash(const char* str, size_t len)
+@@ -60,7 +72,7 @@ void llm_cache_init(void)
+             s_slots[i].response = NULL;
+         }
+         s_slots[i].hash = 0;
+-        s_slots[i].ts = 0;
++        s_slots[i].ts_mono_ms = 0;
+         s_slots[i].hits = 0;
+         s_slots[i].tokens = 0;
+     }
+@@ -78,7 +90,7 @@ char* llm_cache_get(const char* prompt, size_t prompt_len)
+     }
+ 
+     uint32_t h = djb2_hash(prompt, prompt_len);
+-    uint32_t now = (uint32_t)time(NULL);
++    uint64_t now = cache_monotonic_ms();
+     char* result = NULL;
+ 
+     pthread_mutex_lock(&s_cache_lock);
+@@ -86,7 +98,8 @@ char* llm_cache_get(const char* prompt, size_t prompt_len)
+         llm_cache_slot_t* s = &s_slots[i];
+         if (s->hash == h && s->response) {
+             /* Check TTL */
+-            if (now - s->ts > LLM_CACHE_TTL_SEC) {
++            if (now < s->ts_mono_ms
++                || now - s->ts_mono_ms > (uint64_t)LLM_CACHE_TTL_SEC * 1000ULL) {
+                 free(s->response);
+                 s->response = NULL;
+                 s->hash = 0;
+@@ -115,21 +128,21 @@ void llm_cache_put(const char* prompt, size_t prompt_len,
+     }
+ 
+     uint32_t h = djb2_hash(prompt, prompt_len);
+-    uint32_t now = (uint32_t)time(NULL);
++    uint64_t now = cache_monotonic_ms();
+ 
+     pthread_mutex_lock(&s_cache_lock);
+ 
+     /* Find: existing slot with same hash, or LRU (oldest ts) */
+     int target = 0;
+-    uint32_t oldest_ts = UINT32_MAX;
++    uint64_t oldest_ts = UINT64_MAX;
+ 
+     for (int i = 0; i < LLM_CACHE_SLOTS; i++) {
+         if (s_slots[i].hash == h) {
+             target = i;
+             break;
+         }
+-        if (s_slots[i].ts < oldest_ts) {
+-            oldest_ts = s_slots[i].ts;
++        if (s_slots[i].ts_mono_ms < oldest_ts) {
++            oldest_ts = s_slots[i].ts_mono_ms;
+             target = i;
+         }
+     }
+@@ -146,8 +159,9 @@ void llm_cache_put(const char* prompt, size_t prompt_len,
+         return;
+     }
+     s->hash = h;
+-    s->ts = now;
++    s->ts_mono_ms = now;
+     s->hits = 0;
++    s->tokens = 0;
+ 
+     pthread_mutex_unlock(&s_cache_lock);
+ }
+@@ -195,6 +209,17 @@ void llm_cache_cleanup(void)
+     for (int i = 0; i < LLM_CACHE_SLOTS; i++) {
+         free(s_slots[i].response);
+         s_slots[i].response = NULL;
++        s_slots[i].hash = 0;
++        s_slots[i].ts_mono_ms = 0;
++        s_slots[i].hits = 0;
++        s_slots[i].tokens = 0;
+     }
++    s_tokens_saved = 0;
++    s_total_hits = 0;
+     pthread_mutex_unlock(&s_cache_lock);
+ }
++
++void llm_cache_invalidate(void)
++{
++    llm_cache_cleanup();
++}
+diff --git a/src/llm/llm_proxy.c b/src/llm/llm_proxy.c
+index c54458e..44af927 100644
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "llm/llm_internal.h"
++#include "llm/llm_cache.h"
+ #include "llm/llm_parse.h"
+ #include "llm/llm_proxy.h"
+ #include "core/message_bus.h"
+@@ -35,8 +36,10 @@
+ #endif
+ 
+ #include "cJSON.h"
++#include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <syslog.h>
+ 
+ static const char* TAG = "llm";
+ 
+@@ -56,6 +59,75 @@ static const char *s_diag_last_stage = "router";
+ 
+ static pthread_mutex_t s_llm_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++static size_t first_invalid_utf8(const unsigned char *data, size_t len)
++{
++    for (size_t i = 0; i < len; i++) {
++        unsigned char c = data[i];
++        size_t need;
++        uint32_t code;
++
++        if (c < 0x80) {
++            continue;
++        } else if (c >= 0xc2 && c <= 0xdf) {
++            need = 1;
++            code = c & 0x1f;
++        } else if (c >= 0xe0 && c <= 0xef) {
++            need = 2;
++            code = c & 0x0f;
++        } else if (c >= 0xf0 && c <= 0xf4) {
++            need = 3;
++            code = c & 0x07;
++        } else {
++            return i;
++        }
++
++        if (need > len - i - 1) {
++            return i;
++        }
++
++        for (size_t j = 1; j <= need; j++) {
++            if ((data[i + j] & 0xc0) != 0x80) {
++                return i + j;
++            }
++            code = (code << 6) | (data[i + j] & 0x3f);
++        }
++
++        if ((need == 1 && code < 0x80)
++            || (need == 2 && code < 0x800)
++            || (need == 3 && code < 0x10000)
++            || (code > 0x10ffff)
++            || (code >= 0xd800 && code <= 0xdfff)) {
++            return i;
++        }
++    }
++
++    return len;
++}
++
++static bool validate_request_json(const char *post_data)
++{
++    size_t len = post_data ? strlen(post_data) : 0;
++    size_t bad = post_data ? first_invalid_utf8(
++        (const unsigned char *)post_data, len) : 0;
++
++    if (!post_data || bad != len) {
++        syslog(LOG_ERR,
++            "[LLM-JSON] body bytes=%zu utf8=invalid offset=%zu value=0x%02x\n",
++            len, bad, post_data ? (unsigned char)post_data[bad] : 0);
++        return false;
++    }
++
++    cJSON *root = cJSON_ParseWithLength(post_data, len);
++    if (!root) {
++        syslog(LOG_ERR, "[LLM-JSON] body bytes=%zu utf8=ok parse=fail\n", len);
++        return false;
++    }
++
++    cJSON_Delete(root);
++    syslog(LOG_INFO, "[LLM-JSON] body bytes=%zu utf8=ok parse=ok\n", len);
++    return true;
++}
++
+ /* Check if host uses OpenAI-compatible max_completion_tokens param */
+ bool is_openai_compat_host(const char* host)
+ {
+@@ -153,62 +225,87 @@ int llm_proxy_init(void)
+ 
+ int llm_set_backend(const char* host, const char* path)
+ {
++    bool changed = false;
++
+     pthread_mutex_lock(&s_llm_lock);
+     if (host && host[0]) {
++        changed = changed || strcmp(s_llm_host, host) != 0;
+         claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
+         strncpy(s_llm_host, host, sizeof(s_llm_host) - 1);
+     }
+     if (path && path[0]) {
++        changed = changed || strcmp(s_llm_path, path) != 0;
+         claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
+         strncpy(s_llm_path, path, sizeof(s_llm_path) - 1);
+     }
+     pthread_mutex_unlock(&s_llm_lock);
++    if (changed) {
++        llm_cache_invalidate();
++    }
+     syslog(LOG_INFO, "[%s] LLM backend: %s%s\n", TAG, s_llm_host, s_llm_path);
+     return OK;
+ }
+ 
+ int llm_set_port(const char* port)
+ {
++    bool changed = false;
++
++    pthread_mutex_lock(&s_llm_lock);
+     if (port && port[0]) {
++        changed = strcmp(s_llm_port, port) != 0;
+         claw_config_set("llm_port", port);
+         strncpy(s_llm_port, port, sizeof(s_llm_port) - 1);
+         s_llm_port[sizeof(s_llm_port) - 1] = '\0';
+     }
++    pthread_mutex_unlock(&s_llm_lock);
++    if (changed) {
++        llm_cache_invalidate();
++    }
+     return OK;
+ }
+ 
+ int llm_set_all(const char* host, const char* path,
+     const char* port, const char* api_key, const char* model)
+ {
++    bool changed = false;
++
+     pthread_mutex_lock(&s_llm_lock);
+ 
+     if (host && host[0]) {
++        changed = changed || strcmp(s_llm_host, host) != 0;
+         claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
+         strncpy(s_llm_host, host, sizeof(s_llm_host) - 1);
+         s_llm_host[sizeof(s_llm_host) - 1] = '\0';
+     }
+     if (path && path[0]) {
++        changed = changed || strcmp(s_llm_path, path) != 0;
+         claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
+         strncpy(s_llm_path, path, sizeof(s_llm_path) - 1);
+         s_llm_path[sizeof(s_llm_path) - 1] = '\0';
+     }
+     if (port && port[0]) {
++        changed = changed || strcmp(s_llm_port, port) != 0;
+         claw_config_set("llm_port", port);
+         strncpy(s_llm_port, port, sizeof(s_llm_port) - 1);
+         s_llm_port[sizeof(s_llm_port) - 1] = '\0';
+     }
+     if (api_key && api_key[0]) {
++        changed = changed || strcmp(s_api_key, api_key) != 0;
+         claw_config_set(AGENT_CFG_KEY_API_KEY, api_key);
+         strncpy(s_api_key, api_key, sizeof(s_api_key) - 1);
+         s_api_key[sizeof(s_api_key) - 1] = '\0';
+     }
+     if (model && model[0]) {
++        changed = changed || strcmp(s_model, model) != 0;
+         claw_config_set(AGENT_CFG_KEY_MODEL, model);
+         strncpy(s_model, model, sizeof(s_model) - 1);
+         s_model[sizeof(s_model) - 1] = '\0';
+     }
+ 
+     pthread_mutex_unlock(&s_llm_lock);
++    if (changed) {
++        llm_cache_invalidate();
++    }
+ 
+     syslog(LOG_INFO, "[%s] LLM config updated atomically: %s%s (model: %s)\n",
+         TAG, s_llm_host, s_llm_path, s_model);
+@@ -622,6 +719,12 @@ int llm_chat(const char* system_prompt, const char* messages_json,
+         return ERROR;
+     }
+ 
++    if (!validate_request_json(post_data)) {
++        free(post_data);
++        snprintf(response_buf, buf_size, "Error: Invalid request JSON");
++        return ERROR;
++    }
++
+     syslog(LOG_INFO, "[%s] Calling LLM API (model: %s, host: %s, %d bytes)\n",
+         TAG, model, llm_host, (int)strlen(post_data));
+ 
+@@ -773,6 +876,11 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         return ERROR;
+     }
+ 
++    if (!validate_request_json(post_data)) {
++        free(post_data);
++        return ERROR;
++    }
++
+     syslog(LOG_INFO,
+         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
+         TAG, model, (int)strlen(post_data));

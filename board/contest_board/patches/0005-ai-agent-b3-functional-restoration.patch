@@ -1,0 +1,210 @@
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -41,6 +41,7 @@
+ #include "../../../../nuttx/mm/mm_heap/mm.h"
+ 
+ #include <pthread.h>
++#include <errno.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -56,6 +57,7 @@
+ #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+ 
+ #define AGENT_LOOP_BISECT_A2E 1
++#define AGENT_LOOP_BISECT_REAL_LOOP 1
+ 
+ #ifndef AGENT_LOOP_BISECT_PSRAM
+ #  define AGENT_LOOP_BISECT_PSRAM 1
+@@ -252,6 +254,25 @@
+ static char* handle_slash_remind(const agent_msg_t* msg);
+ static bool llm_call_timed_out(uint32_t latency_ms);
+ 
++static int agent_loop_llm_chat_tools(const char *system_prompt,
++    cJSON *messages, const char *tools_json, llm_response_t *resp)
++{
++    int rc;
++
++    syslog(LOG_INFO, "[ASK-DIAG] llm_begin\n");
++    agent_loop_heap_diag("LLM_PRE");
++    rc = llm_chat_tools(system_prompt, messages, tools_json, resp);
++    agent_loop_heap_diag("LLM_POST");
++    syslog(LOG_INFO, "[ASK-DIAG] llm_done rc=%d http=%d\n", rc,
++        llm_proxy_diag_last_status());
++    if (rc != OK) {
++        syslog(LOG_INFO,
++            "[ASK-DIAG] fail stage=%s rc=%d errno=%d\n",
++            llm_proxy_diag_last_stage(), rc, errno);
++    }
++    return rc;
++}
++
+ /* ── Timeout message constants ─────────────────────────────── */
+ 
+ #define LLM_TIMEOUT_MSG \
+@@ -1015,7 +1036,7 @@
+     char* result = NULL;
+     struct timeval t0, t1;
+     gettimeofday(&t0, NULL);
+-    int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
++    int err = agent_loop_llm_chat_tools(system_prompt, messages, NULL, &resp);
+     gettimeofday(&t1, NULL);
+     uint32_t ms = calc_elapsed_ms(&t0, &t1);
+     bool timed_out = llm_call_timed_out(ms);
+@@ -1049,6 +1070,8 @@
+         out.content = final_text;
+         if (message_bus_push_outbound(&out) != OK) {
+             free(final_text);
++        } else {
++            syslog(LOG_INFO, "[ASK-DIAG] outbound\n");
+         }
+     } else {
+         free(final_text);
+@@ -1185,7 +1208,7 @@
+     char* result = NULL;
+     struct timeval t0, t1;
+     gettimeofday(&t0, NULL);
+-    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
++    int err = agent_loop_llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+     gettimeofday(&t1, NULL);
+     uint32_t ms = calc_elapsed_ms(&t0, &t1);
+     bool timed_out = llm_call_timed_out(ms);
+@@ -1260,7 +1283,7 @@
+         llm_response_t resp;
+         struct timeval tv_start, tv_end;
+         gettimeofday(&tv_start, NULL);
+-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
++        int err = agent_loop_llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+         gettimeofday(&tv_end, NULL);
+         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+ 
+@@ -1278,7 +1301,7 @@
+                 trace.backend_idx = next_idx;
+                 llm_response_free(&resp);
+                 gettimeofday(&tv_start, NULL);
+-                err = llm_chat_tools(sys_prompt, messages,
++                err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                     tools_json, &resp);
+                 gettimeofday(&tv_end, NULL);
+                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+@@ -1378,7 +1401,7 @@
+                     trace.backend_idx = prem_idx;
+ 
+                     gettimeofday(&tv_start, NULL);
+-                    err = llm_chat_tools(sys_prompt, messages,
++                    err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                         tools_json, &resp);
+                     gettimeofday(&tv_end, NULL);
+                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+@@ -1695,12 +1718,14 @@
+         agent_loop_mem_kind(s_tool_pool.buffers[1]), pool_buf_size);
+     agent_loop_heap_diag("TOOL_POOL");
+ 
++#if !AGENT_LOOP_BISECT_REAL_LOOP
+     pthread_mutex_lock(&s_agent_bisect_lock);
+     for (;;) {
+         pthread_cond_wait(&s_agent_bisect_cond, &s_agent_bisect_lock);
+     }
++#endif
+ 
+-#if AGENT_LOOP_BISECT_A2E
++#if AGENT_LOOP_BISECT_A2E && !AGENT_LOOP_BISECT_REAL_LOOP
+     return NULL;
+ #endif
+ 
+@@ -1714,6 +1739,8 @@
+             continue;
+         }
+ 
++        syslog(LOG_INFO, "[ASK-DIAG] inbound\n");
++
+         if (agent_shutdown_requested()) {
+             free(msg.content);
+             free(msg.image_b64);
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -51,6 +51,9 @@
+ static char s_vision_host[128] = { 0 };
+ static char s_vision_api_key[128] = { 0 };
+ 
++static int s_diag_last_status;
++static const char *s_diag_last_stage = "router";
++
+ static pthread_mutex_t s_llm_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ /* Check if host uses OpenAI-compatible max_completion_tokens param */
+@@ -691,6 +694,8 @@
+     const char* tools_json, llm_response_t* resp)
+ {
+     memset(resp, 0, sizeof(*resp));
++    s_diag_last_status = 0;
++    s_diag_last_stage = "router";
+ 
+     /* Snapshot config under lock */
+     char model[64];
+@@ -787,11 +792,14 @@
+ 
+         rb.len = 0;
+         status = 0;
++        s_diag_last_stage = "send";
+         err = llm_http_call(post_data, &rb, &status);
++        s_diag_last_status = status;
+         syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
+             status);
+ 
+         if (err != OK) {
++            s_diag_last_stage = "recv";
+             resp_buf_free(&rb);
+             free(post_data);
+             return err;
+@@ -807,6 +815,7 @@
+     free(post_data);
+ 
+     if (status != 200) {
++        s_diag_last_stage = "recv";
+         syslog(LOG_ERR, "[%s] API error %d: %.500s\n", TAG, status,
+             rb.data ? rb.data : "");
+         resp_buf_free(&rb);
+@@ -814,6 +823,7 @@
+     }
+ 
+     syslog(LOG_INFO, "[ASK-DIAG] response json parse begin\n");
++    s_diag_last_stage = "parse";
+     cJSON* root = cJSON_Parse(rb.data);
+ 
+     resp_buf_free(&rb);
+@@ -934,6 +944,8 @@
+ 
+     cJSON_Delete(root);
+ 
++    s_diag_last_stage = "done";
++
+     syslog(LOG_INFO,
+         "[%s] Response: %d bytes text, %d tool calls, finish=%s\n",
+         TAG, (int)resp->text_len, resp->call_count,
+@@ -941,3 +953,13 @@
+ 
+     return OK;
+ }
++
++int llm_proxy_diag_last_status(void)
++{
++    return s_diag_last_status;
++}
++
++const char* llm_proxy_diag_last_stage(void)
++{
++    return s_diag_last_stage;
++}
+--- a/src/llm/llm_proxy.h
++++ b/src/llm/llm_proxy.h
+@@ -78,6 +78,9 @@
+     const char* tools_json,
+     llm_response_t* resp);
+ 
++int llm_proxy_diag_last_status(void);
++const char* llm_proxy_diag_last_stage(void);
++
+ /** Vision chat: send text + base64 image to a vision-capable model.
+  *  image_b64 is the raw base64 string (no data: prefix).
+  *  mime_type: "image/jpeg", "image/png", etc. NULL defaults to "image/jpeg". */

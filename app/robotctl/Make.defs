@@ -1,0 +1,8 @@
+############################################################################
+# Contest 2026 EDA Robot control application
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_295_ROBOTCTL),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_295_robotctl
+endif
+

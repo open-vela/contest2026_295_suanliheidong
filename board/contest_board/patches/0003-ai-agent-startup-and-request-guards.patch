@@ -1,0 +1,2845 @@
+diff --git a/packages/ai_agent/CMakeLists.txt b/packages/ai_agent/CMakeLists.txt
+index 0533a338284dd3e7622301801a783bfdb3743a87..252554d56a3ac9fb082f5e646229c51920bcad4b 100644
+--- a/packages/ai_agent/CMakeLists.txt
++++ b/packages/ai_agent/CMakeLists.txt
+@@ -61,6 +61,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
+     src/voice/volc_tts.c
+     src/voice/volc_tts_ws.c
+     src/voice/volc_asr.c
++    src/voice/mimo_voice.c
+     src/voice/voice_tts.c
+     src/voice/voice_asr.c
+     src/voice/audio_capture.c
+diff --git a/packages/ai_agent/Makefile b/packages/ai_agent/Makefile
+index efa4c8fc59d6c6bab541afed6550e7dbb9053f6e..b83741d1ea4110baa2cd7cc523887b221644b20d 100644
+--- a/packages/ai_agent/Makefile
++++ b/packages/ai_agent/Makefile
+@@ -121,6 +121,7 @@ CSRCS += src/voice/voice_asr.c
+ CSRCS += src/voice/volc_tts.c
+ CSRCS += src/voice/volc_tts_ws.c
+ CSRCS += src/voice/volc_asr.c
++CSRCS += src/voice/mimo_voice.c
+ CSRCS += src/voice/audio_capture.c
+ CSRCS += src/voice/audio_playback.c
+ 
+diff --git a/packages/ai_agent/docs/channels.md b/packages/ai_agent/docs/channels.md
+index 4ef8696a24d7ba9e8550a4ead1904281ee4f9215..5fe2144ff545095a539f6fe801087c50a9172349 100644
+--- a/packages/ai_agent/docs/channels.md
++++ b/packages/ai_agent/docs/channels.md
+@@ -84,6 +84,10 @@ vela> set_volc_speaker zh_male_chunhou
+ # 4. 切换后端（添加新后端后可用）
+ vela> set_voice_tts volcengine
+ vela> set_voice_asr volcengine
++
++# MiMo explicit backends (reuse set_llm host/path/key)
++vela> set_voice_tts mimo-v2.5-tts
++vela> set_voice_asr mimo-v2.5-asr
+ ```
+ 
+ ### 测试（QEMU 文件模式）
+@@ -183,7 +187,7 @@ vela> weixin_login
+ 
+ | 模型 | 说明 |
+ |------|------|
+-| `mimo-v2-flash` | 默认，轻量快速 |
++| `mimo-v2.5` | 默认文本模型 |
+ | `mimo-v2-omni` | 多模态 |
+ | `mimo-v2-pro` | 高质量推理 |
+ | `mimo-v2-tts` | 语音合成 |
+diff --git a/packages/ai_agent/docs/cli.md b/packages/ai_agent/docs/cli.md
+index e99caebbf1a383790f27e7421e7982d2b6a5fb41..e2da8c6fb0c5149a149a9160e555eff6f74df727 100644
+--- a/packages/ai_agent/docs/cli.md
++++ b/packages/ai_agent/docs/cli.md
+@@ -56,16 +56,22 @@ AI Agent 通过 NuttX NSH shell 提供以下命令。启动后输入 `help` 查
+ 
+ | 命令 | 说明 |
+ |------|------|
++| `set_mimo_key <api_key>` | 设置 MiMo ASR/TTS 备用 API Key（优先复用 `set_llm` 的 Key） |
+ | `set_volc_key <api_key>` | 设置 TTS API Key |
+ | `set_volc_asr <id> <tok> <cluster>` | 设置 ASR 凭证 |
+ | `set_volc_speaker <id>` | 设置 TTS 语音角色 |
+-| `set_voice_tts <name>` | 切换 TTS 后端 |
+-| `set_voice_asr <name>` | 切换 ASR 后端 |
++| `set_voice_tts <mimo-v2.5-tts\|volcengine>` | 切换 TTS 后端 |
++| `set_voice_asr <mimo-v2.5-asr\|volcengine>` | 切换 ASR 后端 |
+ | `voice_start` | 启动语音通道 |
+ | `voice_stop` | 停止语音通道 |
+ | `voice_test_tts <text> [out.pcm]` | 测试 TTS 合成 |
+ | `voice_test_asr <file>` | 测试 ASR 识别 |
+ 
++默认语音后端为 `mimo-v2.5-asr` / `mimo-v2.5-tts`；`volcengine` 保留为兼容后端。MiMo ASR/TTS
++使用 `token-plan-cn.xiaomimimo.com:443/v1/chat/completions`，ASR 输入为
++16 kHz、单声道、16-bit PCM（封装为内存 WAV），TTS 返回 24 kHz、单声道、
++16-bit WAV 并在播放前解包为 PCM。
++
+ ## 网络
+ 
+ | 命令 | 说明 |
+diff --git a/packages/ai_agent/include/agent_config.h b/packages/ai_agent/include/agent_config.h
+index 711bb6d2d816b2f8b2d483407d4f422c844eeea4..6ef5eeb435d45c7a215b174f77af111681aa05a8 100644
+--- a/packages/ai_agent/include/agent_config.h
++++ b/packages/ai_agent/include/agent_config.h
+@@ -154,9 +154,20 @@
+ #define AGENT_LLM_OPENROUTER_MODEL "qwen/qwen3-coder:free"
+ 
+ /* ── MiMo (Xiaomi MiMo platform) ───────────────────────────── */
+-#define AGENT_LLM_MIMO_HOST "api.xiaomimimo.com"
++#define AGENT_LLM_MIMO_HOST "token-plan-cn.xiaomimimo.com"
+ #define AGENT_LLM_MIMO_PATH "/v1/chat/completions"
+-#define AGENT_LLM_MIMO_MODEL "mimo-v2-flash"
++#define AGENT_LLM_MIMO_MODEL "mimo-v2.5"
++
++/* MiMo voice API (OpenAI-compatible multimodal endpoint). */
++#define AGENT_MIMO_VOICE_HOST "token-plan-cn.xiaomimimo.com"
++#define AGENT_MIMO_VOICE_PORT "443"
++#define AGENT_MIMO_VOICE_PATH "/v1/chat/completions"
++#define AGENT_MIMO_ASR_MODEL "mimo-v2.5-asr"
++#define AGENT_MIMO_TTS_MODEL "mimo-v2.5-tts"
++#define AGENT_MIMO_TTS_VOICE "mimo_default"
++#define AGENT_MIMO_TTS_SAMPLE_RATE 24000
++#define AGENT_MIMO_MAX_AUDIO_BYTES (256 * 1024)
++#define AGENT_MIMO_HTTP_RESP_BYTES (256 * 1024)
+ 
+ /* ── Message Bus ────────────────────────────────────────────── */
+ #define AGENT_BUS_QUEUE_LEN 16
+@@ -255,6 +266,7 @@
+ #define AGENT_CFG_KEY_GATEWAY_HOST "gateway_host"
+ #define AGENT_CFG_KEY_GATEWAY_PORT "gateway_port"
+ #define AGENT_CFG_KEY_GATEWAY_TOKEN "gateway_token"
++#define AGENT_CFG_KEY_MIMO_API_KEY "mimo_api_key"
+ 
+ /* ── Vision / Multimodal ─────────────────────────────────────── */
+ #define AGENT_VISION_MAX_IMAGE_SIZE \
+diff --git a/packages/ai_agent/include/voice/mimo_voice.h b/packages/ai_agent/include/voice/mimo_voice.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8782ced42342540ef548e63711c1d3449c4c09c
+--- /dev/null
++++ b/packages/ai_agent/include/voice/mimo_voice.h
+@@ -0,0 +1,20 @@
++/*
++ * Copyright (C) 2026 Xiaomi Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ */
++
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Register the MiMo ASR/TTS backends with the generic voice framework. */
++int mimo_asr_register(void);
++int mimo_tts_register(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/packages/ai_agent/include/voice/voice_asr.h b/packages/ai_agent/include/voice/voice_asr.h
+index 136c93a8243b9a9b1327471bdaa93af75ddb32be..58cb2629ec970d45ce46a2b3d01a3e3edeb49b51 100644
+--- a/packages/ai_agent/include/voice/voice_asr.h
++++ b/packages/ai_agent/include/voice/voice_asr.h
+@@ -25,6 +25,8 @@ extern "C" {
+ /* Generic ASR backend interface. Each provider implements this struct
+  * and registers via voice_asr_register(). */
+ 
++typedef struct voice_asr_stream voice_asr_stream_t;
++
+ typedef struct voice_asr_ops {
+     const char *name;
+ 
+@@ -37,6 +39,12 @@ typedef struct voice_asr_ops {
+                      char *text_out,
+                      size_t text_cap);
+ 
++    /* Optional streaming operations. NULL means batch-only backend. */
++    void *(*stream_open)(void);
++    int (*stream_send)(void *stream, const unsigned char *pcm, size_t len);
++    int (*stream_finish)(void *stream, char *text_out, size_t text_cap);
++    void (*stream_abort)(void *stream);
++
+     /* Release resources held by the backend. */
+     void (*deinit)(void);
+ } voice_asr_ops_t;
+@@ -50,6 +58,9 @@ int voice_asr_set_backend(const char *name);
+ /* Get the name of the current active backend, or NULL. */
+ const char *voice_asr_get_backend(void);
+ 
++/* Return non-zero when the active backend supports streaming recognition. */
++int voice_asr_supports_streaming(void);
++
+ /* Recognize speech using the active backend. */
+ int voice_asr_recognize(const unsigned char *pcm_data,
+                         size_t pcm_len,
+@@ -59,8 +70,6 @@ int voice_asr_recognize(const unsigned char *pcm_data,
+ /* ── Streaming ASR interface ─────────────────────────────────── */
+ 
+ /* Opaque handle for a streaming ASR session. */
+-typedef struct voice_asr_stream voice_asr_stream_t;
+-
+ /* Open a streaming ASR session using the active backend.
+  * Returns NULL if the backend does not support streaming. */
+ voice_asr_stream_t *voice_asr_stream_open(void);
+diff --git a/packages/ai_agent/include/voice/voice_tts.h b/packages/ai_agent/include/voice/voice_tts.h
+index 35ce708fdcfabac7bca96649bffd5d75034f8f8d..d0f5bcab3f3f3177e857f967ac55013cb049fea9 100644
+--- a/packages/ai_agent/include/voice/voice_tts.h
++++ b/packages/ai_agent/include/voice/voice_tts.h
+@@ -22,6 +22,12 @@
+ extern "C" {
+ #endif
+ 
++/* Callback invoked for each PCM chunk received from TTS. */
++typedef void (*voice_tts_chunk_cb)(const unsigned char *pcm_data,
++                                   size_t pcm_len,
++                                   int is_last,
++                                   void *user_data);
++
+ /* Generic TTS backend interface. Each provider implements this struct
+  * and registers via voice_tts_register(). */
+ 
+@@ -31,12 +37,17 @@ typedef struct voice_tts_ops {
+     /* Load credentials from config store. */
+     int (*init)(void);
+ 
+-    /* Synthesize UTF-8 text into raw PCM (16-bit LE, 16kHz, mono). */
++    /* Synthesize UTF-8 text into raw PCM (16-bit LE, mono). */
+     int (*synthesize)(const char *text,
+                       unsigned char *pcm_out,
+                       size_t pcm_cap,
+                       size_t *pcm_len);
+ 
++    /* Optional streaming operation. NULL means batch-only backend. */
++    int (*stream_synthesize)(const char *text,
++                             voice_tts_chunk_cb cb,
++                             void *user_data);
++
+     /* Release resources held by the backend. */
+     void (*deinit)(void);
+ } voice_tts_ops_t;
+@@ -58,15 +69,6 @@ int voice_tts_speak(const char *text,
+ 
+ /* ── Streaming TTS interface ─────────────────────────────────── */
+ 
+-/* Callback invoked for each PCM chunk received from TTS.
+- * pcm_data/pcm_len: decoded PCM audio (16-bit LE, 16kHz, mono).
+- * is_last: 1 if this is the final chunk.
+- * user_data: opaque pointer passed to voice_tts_speak_stream(). */
+-typedef void (*voice_tts_chunk_cb)(const unsigned char *pcm_data,
+-                                   size_t pcm_len,
+-                                   int is_last,
+-                                   void *user_data);
+-
+ /* Synthesize text with streaming callback. Each decoded PCM chunk
+  * is delivered via cb as it arrives from the TTS server.
+  * Returns 0 on success, negative errno on error. */
+diff --git a/packages/ai_agent/src/channels/cmd_llm.c b/packages/ai_agent/src/channels/cmd_llm.c
+index 0bda07fe679df706b8023ffea861178b14cfdaee..fb632ca14fb11261fc4ea822b09565469f9140a8 100644
+--- a/packages/ai_agent/src/channels/cmd_llm.c
++++ b/packages/ai_agent/src/channels/cmd_llm.c
+@@ -47,7 +47,8 @@ static const router_preset_t g_router_presets[] = {
+     { "glm", "open.bigmodel.cn", "/api/paas/v4/chat/completions", "glm-4-flash", 1 },
+     { "openai", "api.openai.com", "/v1/chat/completions", "gpt-4o", 3 },
+     { "claude", "api.anthropic.com", "/v1/messages", "claude-sonnet-4-20250514", 3 },
+-    { "mimo", "api.xiaomimimo.com", "/v1/chat/completions", "mimo-v2-flash", 1 },
++    { "mimo", AGENT_LLM_MIMO_HOST, AGENT_LLM_MIMO_PATH,
++        AGENT_LLM_MIMO_MODEL, 1 },
+     { "openrouter", "openrouter.ai", "/api/v1/chat/completions",
+         "openrouter/hunter-alpha", 2 },
+     { NULL, NULL, NULL, NULL, 0 }
+@@ -69,7 +70,7 @@ void cmd_set_llm(int argc, char** argv)
+                "  glm      - open.bigmodel.cn  (glm-4-flash)\n"
+                "  openai   - api.openai.com  (gpt-4o)\n"
+                "  openrouter - openrouter.ai  (openrouter/hunter-alpha)\n"
+-               "  mimo     - api.xiaomimimo.com  (MiMo-v2-Flash)\n"
++               "  mimo     - token-plan-cn.xiaomimimo.com  (mimo-v2.5)\n"
+                "\n"
+                "URL format (for custom endpoints):\n"
+                "  set_llm http://host:port/path model key\n"
+diff --git a/packages/ai_agent/src/channels/cmd_voice.c b/packages/ai_agent/src/channels/cmd_voice.c
+index 7eb5a1f5e5fca0ee5145bf090db2edcb477ec465..a81831b7a5ccafd6535d77c766b6082c38c965da 100644
+--- a/packages/ai_agent/src/channels/cmd_voice.c
++++ b/packages/ai_agent/src/channels/cmd_voice.c
+@@ -58,6 +58,17 @@ void cmd_set_volc_asr(int argc, char** argv)
+         argv[1], argv[3]);
+ }
+ 
++void cmd_set_mimo_key(int argc, char** argv)
++{
++    if (argc < 2) {
++        printf("Usage: set_mimo_key <api_key>\n");
++        return;
++    }
++
++    claw_config_set(AGENT_CFG_KEY_MIMO_API_KEY, argv[1]);
++    printf("MiMo voice API key saved.\n");
++}
++
+ void cmd_voice_start(void)
+ {
+     voice_channel_start();
+@@ -68,6 +79,15 @@ void cmd_voice_stop(void)
+     voice_channel_stop();
+ }
+ 
++void cmd_voice_recordmem(void)
++{
++    int ret = voice_channel_record_once(3000);
++
++    if (ret < 0) {
++        printf("voice_echo recordmem failed: %d\n", ret);
++    }
++}
++
+ void cmd_voice_test_tts(int argc, char** argv)
+ {
+     if (argc < 2) {
+diff --git a/packages/ai_agent/src/channels/cmd_voice.h b/packages/ai_agent/src/channels/cmd_voice.h
+index a9a00b92ae0847969ec0e621b37c40916851abfc..b6a8526a5085e1e14ba0184e51fec10aa279a949 100644
+--- a/packages/ai_agent/src/channels/cmd_voice.h
++++ b/packages/ai_agent/src/channels/cmd_voice.h
+@@ -19,8 +19,10 @@
+ void cmd_set_volc_key(int argc, char** argv);
+ void cmd_set_volc_speaker(int argc, char** argv);
+ void cmd_set_volc_asr(int argc, char** argv);
++void cmd_set_mimo_key(int argc, char** argv);
+ void cmd_voice_start(void);
+ void cmd_voice_stop(void);
++void cmd_voice_recordmem(void);
+ void cmd_voice_test_tts(int argc, char** argv);
+ void cmd_voice_test_asr(int argc, char** argv);
+ void cmd_set_voice_tts(int argc, char** argv);
+diff --git a/packages/ai_agent/src/channels/nsh_commands.c b/packages/ai_agent/src/channels/nsh_commands.c
+index 25875b50c47817c512303ed6f195e2dd1abd0959..b1e407f7b93d4ded49b7a680f10815a0e0a9042b 100644
+--- a/packages/ai_agent/src/channels/nsh_commands.c
++++ b/packages/ai_agent/src/channels/nsh_commands.c
+@@ -130,12 +130,14 @@ static void cmd_help(void)
+         "  set_volc_key <api_key>       - Set Doubao voice API key\n"
+         "  set_volc_asr <id> <tok> <cluster> - Set ASR credentials\n"
+         "  set_volc_speaker <id>  - Set TTS voice (e.g. zh_female_cancan)\n"
++        "  set_mimo_key <api_key>       - Set MiMo ASR/TTS API key\n"
++        "  voice_echo recordmem     - Record 3s and send to agent\n"
+         "  voice_start            - Start voice channel\n"
+         "  voice_stop             - Stop voice channel\n"
+         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
+         "  voice_test_asr <file>  - Test ASR recognition\n"
+-        "  set_voice_tts <name>   - Switch TTS backend\n"
+-        "  set_voice_asr <name>   - Switch ASR backend\n"
++        "  set_voice_tts <mimo-v2.5-tts|volcengine> - Switch TTS backend\n"
++        "  set_voice_asr <mimo-v2.5-asr|volcengine> - Switch ASR backend\n"
+         "  set_weixin_token <tok> - Set WeChat bot token\n"
+         "  weixin_login           - QR code login to WeChat\n"
+         "  router_status          - Show LLM router status\n"
+@@ -941,6 +943,9 @@ static void* cli_thread(void* arg)
+             cmd_session_clear_all();
+         else if (strcmp(cmd, "heap_info") == 0)
+             cmd_heap_info();
++        else if (strcmp(cmd, "voice_echo") == 0 && argc == 2 &&
++                 strcmp(argv[1], "recordmem") == 0)
++            cmd_voice_recordmem();
+         else if (strcmp(cmd, "set_proxy") == 0)
+             cmd_set_proxy(argc, argv);
+         else if (strcmp(cmd, "clear_proxy") == 0)
+@@ -996,6 +1001,8 @@ static void* cli_thread(void* arg)
+             cmd_set_volc_key(argc, argv);
+         else if (strcmp(cmd, "set_volc_asr") == 0)
+             cmd_set_volc_asr(argc, argv);
++        else if (strcmp(cmd, "set_mimo_key") == 0)
++            cmd_set_mimo_key(argc, argv);
+         else if (strcmp(cmd, "set_volc_speaker") == 0)
+             cmd_set_volc_speaker(argc, argv);
+         else if (strcmp(cmd, "voice_start") == 0)
+diff --git a/packages/ai_agent/src/core/agent_loop.c b/packages/ai_agent/src/core/agent_loop.c
+index d190a505fb25f72cea4b426e505d18b01a36f8ce..5956ac38539728d610dd0b5dbfbea2eceed481f6 100644
+--- a/packages/ai_agent/src/core/agent_loop.c
++++ b/packages/ai_agent/src/core/agent_loop.c
+@@ -30,6 +30,7 @@
+ #include "core/message_bus.h"
+ #include "core/session_mgr.h"
+ #include "llm/llm_cache.h"
++#include "llm/llm_parse.h"
+ #include "llm/llm_proxy.h"
+ #include "llm/llm_router.h"
+ #include "tools/skill_loader.h"
+@@ -53,6 +54,76 @@ static const char* TAG = "agent";
+ #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
+ #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+ 
++/* ESP32-S3 external RAM virtual-address range.  The contest configuration
++ * registers PSRAM as a heap region after the smaller internal heap. */
++#define AGENT_PSRAM_LOW  0x3c000000u
++#define AGENT_PSRAM_HIGH 0x3e000000u
++
++static bool agent_ptr_in_psram(const void* ptr)
++{
++    uintptr_t addr = (uintptr_t)ptr;
++
++    return addr >= AGENT_PSRAM_LOW && addr < AGENT_PSRAM_HIGH;
++}
++
++/*
++ * Keep long-lived agent buffers out of internal RAM.  The allocator services
++ * internal RAM first, so temporary allocations advance the request into the
++ * PSRAM heap and are returned before this function succeeds.
++ */
++static void* agent_calloc_psram(size_t size)
++{
++    void* discarded[64];
++    size_t count = 0;
++
++    while (count < sizeof(discarded) / sizeof(discarded[0])) {
++        void* ptr = calloc(1, size);
++
++        if (ptr == NULL || agent_ptr_in_psram(ptr)) {
++            while (count > 0) {
++                free(discarded[--count]);
++            }
++
++            return ptr;
++        }
++
++        discarded[count++] = ptr;
++    }
++
++    while (count > 0) {
++        free(discarded[--count]);
++    }
++
++    return NULL;
++}
++
++static int agent_pool_init_psram(agent_mem_pool_t* pool, size_t buf_size,
++    int count)
++{
++    if (count > AGENT_POOL_SLOTS) {
++        count = AGENT_POOL_SLOTS;
++    }
++
++    memset(pool, 0, sizeof(*pool));
++    pool->buf_size = buf_size;
++    pool->count = count;
++    pthread_mutex_init(&pool->lock, NULL);
++
++    for (int i = 0; i < count; i++) {
++        pool->buffers[i] = agent_calloc_psram(buf_size);
++        if (pool->buffers[i] == NULL) {
++            while (i > 0) {
++                free(pool->buffers[--i]);
++            }
++
++            pthread_mutex_destroy(&pool->lock);
++            return ERROR;
++        }
++    }
++
++    return OK;
++}
++
+ /* ── Forward declarations ──────────────────────────────────── */
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+@@ -894,6 +965,7 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
+     }
+     if (strcmp(msg->channel, AGENT_CHAN_FEISHU) == 0
+         || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
++        || strcmp(msg->channel, "cli") == 0
+ #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+         || strcmp(msg->channel, AGENT_CHAN_QUICKAPP) == 0
+ #endif
+@@ -1427,9 +1499,9 @@ static void* agent_loop_task(void* arg)
+     size_t tool_size = agent_mem_safe_size(
+         TOOL_OUTPUT_SIZE, TOOL_OUTPUT_SIZE_MIN);
+ 
+-    char* sys_prompt = calloc(1, ctx_size);
+-    char* history_json = calloc(1, hist_size);
+-    char* tool_output = calloc(1, tool_size);
++    char* sys_prompt = agent_calloc_psram(ctx_size);
++    char* history_json = agent_calloc_psram(hist_size);
++    char* tool_output = agent_calloc_psram(tool_size);
+ 
+     if (!sys_prompt || !history_json || !tool_output) {
+         syslog(LOG_ERR, "[%s] Failed to allocate agent buffers\n", TAG);
+@@ -1441,11 +1513,15 @@ static void* agent_loop_task(void* arg)
+ 
+     syslog(LOG_INFO, "[%s] Buffers: ctx=%zu hist=%zu tool=%zu\n",
+         TAG, ctx_size, hist_size, tool_size);
++    syslog(LOG_INFO, "[%s] Buffer memory: ctx=%s hist=%s tool=%s\n", TAG,
++        agent_ptr_in_psram(sys_prompt) ? "PSRAM" : "INTERNAL",
++        agent_ptr_in_psram(history_json) ? "PSRAM" : "INTERNAL",
++        agent_ptr_in_psram(tool_output) ? "PSRAM" : "INTERNAL");
+ 
+     /* Initialize memory pool for parallel tool outputs */
+     size_t pool_buf_size = agent_mem_safe_size(
+         TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
+-    if (agent_pool_init(&s_tool_pool, pool_buf_size,
++    if (agent_pool_init_psram(&s_tool_pool, pool_buf_size,
+             AGENT_MAX_TOOL_CALLS)
+         == OK) {
+         s_pool_ready = true;
+@@ -1551,6 +1627,13 @@ static void* agent_loop_task(void* arg)
+         cJSON* messages = build_messages(msg.chat_id, msg.content,
+             history_json, hist_size);
+ 
++        if (!llm_heap_gate_check("PRE_REACT")) {
++            /* Do not free the request objects: allocator metadata is already
++             * invalid and cleanup could turn a diagnosable error into a panic. */
++            syslog(LOG_ERR, "[ASK-DIAG] react_blocked heap_invalid\n");
++            continue;
++        }
++
+         char* final_text = NULL;
+ 
+         /* Vision path */
+diff --git a/packages/ai_agent/src/infra/network_manager.c b/packages/ai_agent/src/infra/network_manager.c
+index 00cc296a3736020fcdb346300d74690ec5cc47e0..5b09641ca920ff49badf2cc9fe46103f514a81bb 100644
+--- a/packages/ai_agent/src/infra/network_manager.c
++++ b/packages/ai_agent/src/infra/network_manager.c
+@@ -110,7 +110,7 @@ const char* network_get_ip(void)
+ #include <nuttx/net/netconfig.h>
+ #include <sys/ioctl.h>
+ 
+-int network_wifi_connect(const char* iface, const char* ssid,
++static int network_wifi_connect_unlocked(const char* iface, const char* ssid,
+     const char* pass)
+ {
+     (void)iface;
+@@ -769,9 +769,13 @@ int network_wifi_reconnect(void)
+ /* Real hardware: use NuttX wapi shell command to join WiFi */
+ #include "infra/config_store.h"
+ #include "agent_config.h"
++#include <errno.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++static pthread_mutex_t s_wifi_connect_lock = PTHREAD_MUTEX_INITIALIZER;
++
+ /*
+  * Wrap src in single quotes for safe use inside a system() shell command.
+  * Every embedded ' is replaced by the sequence '\'' so arbitrary SSID/PSK
+@@ -801,12 +805,32 @@ static int shell_quote(const char* src, char* buf, size_t buf_size)
+     return 0;
+ }
+ 
++static int run_nsh_command(const char* label, const char* cmd)
++{
++    syslog(LOG_INFO, "[WIFI-DIAG] %s\n", label);
++    int ret = system(cmd);
++
++    if (ret != 0) {
++        syslog(LOG_ERR, "[%s] %s failed: rc=%d errno=%d\n", TAG, label,
++            ret, errno);
++        return ERROR;
++    }
++
++    syslog(LOG_INFO, "[%s] %s OK\n", TAG, label);
++    return OK;
++}
++
+ int network_wifi_connect(const char* iface, const char* ssid,
+     const char* pass)
+ {
++    int result;
++
++    pthread_mutex_lock(&s_wifi_connect_lock);
++
+     if (!ssid || ssid[0] == '\0') {
+         syslog(LOG_ERR, "[%s] wifi_connect: SSID required\n", TAG);
+-        return ERROR;
++        result = ERROR;
++        goto out;
+     }
+ 
+     const char* dev = (iface && iface[0]) ? iface : "wlan0";
+@@ -817,60 +841,65 @@ int network_wifi_connect(const char* iface, const char* ssid,
+     char q_ssid[192], q_pass[384];
+     if (shell_quote(ssid, q_ssid, sizeof(q_ssid)) != 0) {
+         syslog(LOG_ERR, "[%s] wifi_connect: SSID too long or unquotable\n", TAG);
+-        return ERROR;
++        result = ERROR;
++        goto out;
+     }
+     if (pass && pass[0] && shell_quote(pass, q_pass, sizeof(q_pass)) != 0) {
+         syslog(LOG_ERR, "[%s] wifi_connect: PSK too long or unquotable\n", TAG);
+-        return ERROR;
++        result = ERROR;
++        goto out;
+     }
+ 
+     syslog(LOG_INFO, "[%s] Connecting WiFi SSID=%s on %s\n", TAG, ssid, dev);
+ 
+     snprintf(cmd, sizeof(cmd), "ifup %s", dev); /* bring up iface first */
+-    system(cmd);
++    if (run_nsh_command("ifup", cmd) != OK) {
++        result = ERROR;
++        goto out;
++    }
+     usleep(500000); /* wait for driver ready */
+ 
+     snprintf(cmd, sizeof(cmd), "wapi mode %s 2", dev); /* MANAGED */
+-    system(cmd);
++    if (run_nsh_command("wapi mode", cmd) != OK) {
++        result = ERROR;
++        goto out;
++    }
+ 
+     if (pass && pass[0]) {
+-        snprintf(cmd, sizeof(cmd), "wapi psk %s %s 3", dev, q_pass);
+-        system(cmd);
++        snprintf(cmd, sizeof(cmd), "wapi psk %s %s 3 2", dev, q_pass);
++        if (run_nsh_command("wapi psk", cmd) != OK) {
++            result = ERROR;
++            goto out;
++        }
+     }
+ 
+     snprintf(cmd, sizeof(cmd), "wapi essid %s %s 1", dev, q_ssid);
+-    system(cmd);
++    if (run_nsh_command("wapi essid", cmd) != OK) {
++        result = ERROR;
++        goto out;
++    }
+     usleep(2000000); /* wait for AP association */
+ 
+     /* P1: verify WiFi association before requesting DHCP.
+-     * 'wapi status' always exits 0 (it just prints iface state), so
+-     * checking its return code is useless. Instead, parse the output
+-     * for "Not-Associated" which wapi prints when no AP is joined.
+-     * If popen fails we fall through and let network_wait_connected
+-     * handle the timeout. */
++     * 'wapi show' is diagnostic only. Do not use its output to gate DHCP;
++     * network_wait_connected() is the authoritative end-to-end check. */
+     {
+-        bool associated = true;
+-        snprintf(cmd, sizeof(cmd), "wapi status %s", dev);
++        snprintf(cmd, sizeof(cmd), "wapi show %s", dev);
+         FILE* fp = popen(cmd, "r");
+         if (fp) {
+             char line[256];
+             while (fgets(line, sizeof(line), fp)) {
+-                if (strstr(line, "Not-Associated")) {
+-                    associated = false;
+-                    break;
+-                }
++                (void)line;
+             }
+             pclose(fp);
+         }
+-        if (!associated) {
+-            syslog(LOG_ERR,
+-                "[%s] WiFi not associated (no carrier), skipping DHCP\n", TAG);
+-            return ERROR;
+-        }
+     }
+ 
++    syslog(LOG_INFO, "[WIFI-DIAG] dhcp/renew\n");
+     snprintf(cmd, sizeof(cmd), "renew %s", dev); /* DHCP */
+-    system(cmd);
++    if (run_nsh_command("renew", cmd) != OK)
++        syslog(LOG_WARNING,
++            "[%s] DHCP command failed; continuing IP wait\n", TAG);
+ 
+     /* Persist credentials.
+      * P2: always write the PSK slot — even when pass is empty — so that
+@@ -885,7 +914,11 @@ int network_wifi_connect(const char* iface, const char* ssid,
+         syslog(LOG_INFO, "[%s] WiFi connected: %s\n", TAG, network_get_ip());
+     else
+         syslog(LOG_WARNING, "[%s] No IP after 15s — check SSID/password\n", TAG);
+-    return err;
++    result = err;
++
++out:
++    pthread_mutex_unlock(&s_wifi_connect_lock);
++    return result;
+ }
+ 
+ int network_wifi_reconnect(void)
+diff --git a/packages/ai_agent/src/infra/vela_tls.c b/packages/ai_agent/src/infra/vela_tls.c
+index 0b36760b3e79993ec394f1116d3a269b89ddbe9e..48931cedf5716149325d254df724eda2cabf2ccb 100644
+--- a/packages/ai_agent/src/infra/vela_tls.c
++++ b/packages/ai_agent/src/infra/vela_tls.c
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ #include <errno.h>
++#include <inttypes.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -41,6 +42,7 @@
+ #include "mbedtls/error.h"
+ #include "mbedtls/net_sockets.h"
+ #include "mbedtls/ssl.h"
++#include "mbedtls/ssl_ciphersuites.h"
+ 
+ #include <fcntl.h>
+ #include <pthread.h>
+@@ -61,6 +63,20 @@ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
+ 
+ static const char* TAG = "vela_tls";
+ 
++/* The contest WLAN netcard uses a 590-byte packet buffer.  Keep encrypted
++ * application records below its TCP payload budget so a large audio upload
++ * does not drive the vendor TX path through fragmented record bursts. */
++#define TLS_WRITE_CHUNK_BYTES 480
++
++/* The software CHACHA20-POLY1305 path was observed with CPU1 idle-stack
++ * corruption during sustained uploads on this ESP32-S3 Wi-Fi build.  The MiMo
++ * endpoint supports this TLS 1.2 AES-GCM suite, which uses the AES path. */
++static const int s_tls_ciphersuites[] = {
++    MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++    MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++    0
++};
++
+ /* ── Chunked transfer decoding ───────────────────────────────── */
+ 
+ /**
+@@ -123,11 +139,23 @@ typedef struct {
+ 
+ static void tls_ctx_free(tls_ctx_t* ctx)
+ {
++    static uint32_t free_seq;
++    uint32_t seq = ++free_seq;
++
++    syslog(LOG_INFO, "[TLS-FREE] seq=%" PRIu32
++        " phase=begin ctx=%p fd=%d\n", seq, ctx, ctx->net.fd);
+     mbedtls_ssl_close_notify(&ctx->ssl);
++    syslog(LOG_INFO, "[TLS-FREE] seq=%" PRIu32 " phase=close_notify\n",
++        seq);
+     mbedtls_net_free(&ctx->net);
++    syslog(LOG_INFO, "[TLS-FREE] seq=%" PRIu32 " phase=net_free\n", seq);
+     mbedtls_ssl_free(&ctx->ssl);
++    syslog(LOG_INFO, "[TLS-FREE] seq=%" PRIu32 " phase=ssl_free\n", seq);
+     mbedtls_ssl_config_free(&ctx->cfg);
++    syslog(LOG_INFO, "[TLS-FREE] seq=%" PRIu32 " phase=config_free\n",
++        seq);
+     mbedtls_ctr_drbg_free(&ctx->ctr_drbg);
++    syslog(LOG_INFO, "[TLS-FREE] seq=%" PRIu32 " phase=done\n", seq);
+ 
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+     network_release_resource();
+@@ -155,6 +183,11 @@ typedef struct {
+ static conn_slot_t s_pool[CONN_POOL_SIZE];
+ static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++/* The ESP32-S3 WLAN/TLS stack is not stable with overlapping handshakes.
++ * Keep the pool metadata lock short, but serialize the complete request
++ * lifecycle below so every caller shares one transport at a time. */
++static pthread_mutex_t s_transport_lock = PTHREAD_MUTEX_INITIALIZER;
++
+ /* Acquire a slot for host:port.  Returns a locked, connected ctx or NULL. */
+ static conn_slot_t* pool_acquire(const char* host, const char* port)
+ {
+@@ -248,14 +281,19 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         return VELA_TLS_ERR_HANDSHAKE;
+     }
+ 
+-    /* Check system time — crucial for TLS certificate validation. */
++    /*
++     * Do not modify CLOCK_REALTIME from an outbound TLS request.  That changes
++     * global state from a worker context and makes elapsed-time users observe
++     * a fabricated multi-year jump.  This no-CA build uses optional
++     * certificate verification.
++     */
+     time_t now = time(NULL);
+     syslog(LOG_DEBUG, "[%s] Handshake start: Host=%s, UNIX=%ld\n", TAG, host, (long)now);
+ 
+     if (now < 1704067200) { /* Jan 1 2024 */
+-        syslog(LOG_WARNING, "[%s] Clock too old, forcing to 2026\n", TAG);
+-        struct timespec ts = { .tv_sec = 1772275200, .tv_nsec = 0 };
+-        clock_settime(CLOCK_REALTIME, &ts);
++        syslog(LOG_WARNING,
++               "[%s] Clock too old; certificate verification is optional\n",
++               TAG);
+     }
+ 
+     /* TCP connect — use HTTP CONNECT proxy if configured */
+@@ -325,6 +363,8 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         return VELA_TLS_ERR_HANDSHAKE;
+     }
+ 
++    mbedtls_ssl_conf_ciphersuites(&ctx->cfg, s_tls_ciphersuites);
++
+     /* Pin the TLS version range to what is actually compiled in.
+      * Setting max to MBEDTLS_SSL_VERSION_TLS1_3 when MBEDTLS_SSL_PROTO_TLS1_3
+      * is not defined causes mbedtls_ssl_setup() to return BAD_CONFIG (-0x5e80).
+@@ -463,11 +503,19 @@ static int tls_write_request(tls_ctx_t* ctx,
+     if (body && body_len > 0) {
+         size_t bw = 0;
+         while (bw < body_len) {
++            size_t chunk = body_len - bw;
++
++            if (chunk > TLS_WRITE_CHUNK_BYTES) {
++                chunk = TLS_WRITE_CHUNK_BYTES;
++            }
+             ret = mbedtls_ssl_write(&ctx->ssl,
+                 (const unsigned char*)(body + bw),
+-                body_len - bw);
++                chunk);
+             if (ret > 0) {
+                 bw += (size_t)ret;
++                if (bw < body_len) {
++                    usleep(1000);
++                }
+             } else if (ret == 0) {
+                 return VELA_TLS_ERR_WRITE;
+             } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+@@ -643,7 +691,7 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+ 
+ /* ── Public API ──────────────────────────────────────────────── */
+ 
+-int vela_https_request(
++static int vela_https_request_locked(
+     const char* host,
+     const char* port,
+     const char* method,
+@@ -744,6 +792,30 @@ int vela_https_request(
+     return ret;
+ }
+ 
++int vela_https_request(
++    const char* host,
++    const char* port,
++    const char* method,
++    const char* path,
++    const vela_header_t* headers,
++    const char* body,
++    size_t body_len,
++    char* resp_buf,
++    size_t resp_cap,
++    size_t* out_body_len)
++{
++    int ret;
++
++    pthread_mutex_lock(&s_transport_lock);
++    syslog(LOG_INFO, "[%s] transport enter: %s:%s\n", TAG, host, port);
++    ret = vela_https_request_locked(host, port, method, path, headers,
++        body, body_len, resp_buf, resp_cap, out_body_len);
++    syslog(LOG_INFO, "[%s] transport leave: %s:%s rc=%d\n", TAG, host,
++        port, ret);
++    pthread_mutex_unlock(&s_transport_lock);
++    return ret;
++}
++
+ int vela_https_get(const char* host, const char* port, const char* path,
+     char* resp_buf, size_t resp_cap)
+ {
+diff --git a/packages/ai_agent/src/llm/llm_parse.c b/packages/ai_agent/src/llm/llm_parse.c
+index fb54994bba05f857327b3c7c48492d0c103da426..ee025374bae98cb7e7e3fc1c04db2590581547b7 100644
+--- a/packages/ai_agent/src/llm/llm_parse.c
++++ b/packages/ai_agent/src/llm/llm_parse.c
+@@ -653,17 +653,19 @@ done:
+     return result->reason == AGENT_HEAP_GATE_NONE;
+ }
+ 
+-static bool agent_heap_gate_tools_parsed(void)
++bool llm_heap_gate_check(const char* stage)
+ {
+     struct agent_heap_gate_result_s result;
+     bool pass = agent_heap_gate_check(&result);
++    const char* name = stage ? stage : "CHECK";
+ 
+     if (pass) {
+-        syslog(LOG_INFO, "[HEAP-GATE] TOOLS_PARSED PASS\n");
++        syslog(LOG_INFO, "[HEAP-GATE] %s PASS\n", name);
+     } else {
+         syslog(LOG_ERR,
+-            "[HEAP-GATE] TOOLS_PARSED FAIL reason=%s(%d) region=%d "
++            "[HEAP-GATE] %s FAIL reason=%s(%d) region=%d "
+             "node=%p flink=%p blink=%p size=%zu\n",
++            name,
+             agent_heap_gate_reason_name(result.reason), result.reason,
+             result.region, (void *)result.node,
+             (void *)result.flink, (void *)result.blink, result.size);
+@@ -687,7 +689,7 @@ cJSON* build_openai_tools_array(const char* tools_json)
+         return NULL;
+     }
+ 
+-    if (!agent_heap_gate_tools_parsed()) {
++    if (!llm_heap_gate_check("TOOLS_PARSED")) {
+         return NULL;
+     }
+ 
+diff --git a/packages/ai_agent/src/llm/llm_parse.h b/packages/ai_agent/src/llm/llm_parse.h
+index 7a22785deed713676bd7535527cd44b8e43abf3e..ca3ff51f17caced59008ffdfae0030681564d483 100644
+--- a/packages/ai_agent/src/llm/llm_parse.h
++++ b/packages/ai_agent/src/llm/llm_parse.h
+@@ -22,6 +22,8 @@
+ 
+ #pragma once
+ 
++#include <stdbool.h>
++
+ /**
+  * llm_parse.h — Tool call parsing and response helpers.
+  */
+@@ -33,6 +35,10 @@
+  * Returns a cJSON array to attach to the request body, or NULL. */
+ cJSON* build_openai_tools_array(const char* tools_json);
+ 
++/* Validate the user heap without allocating.  Callers must abort work that
++ * would allocate when this returns false. */
++bool llm_heap_gate_check(const char* stage);
++
+ /* XML fallback parsers for non-standard models */
+ void parse_xml_tool_calls(llm_response_t* resp);
+ void parse_ns_xml_tool_calls(llm_response_t* resp);
+diff --git a/packages/ai_agent/src/llm/llm_proxy.c b/packages/ai_agent/src/llm/llm_proxy.c
+index dafe492237e3cc7718273fa593e4a91fcbb9f32d..9505003eec8d3ecf0b6c912a135198e4796cea60 100644
+--- a/packages/ai_agent/src/llm/llm_proxy.c
++++ b/packages/ai_agent/src/llm/llm_proxy.c
+@@ -56,6 +56,23 @@ static char s_vision_api_key[128] = { 0 };
+ 
+ static pthread_mutex_t s_llm_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++static int llm_lock_config_snapshot(void)
++{
++    struct timespec deadline;
++
++    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
++        return ERROR;
++    }
++
++    deadline.tv_sec++;
++    int ret = pthread_mutex_timedlock(&s_llm_lock, &deadline);
++    if (ret != 0) {
++        return ERROR;
++    }
++
++    return OK;
++}
++
+ static size_t first_invalid_utf8(const unsigned char *data, size_t len)
+ {
+     for (size_t i = 0; i < len; i++) {
+@@ -270,32 +287,32 @@ int llm_set_all(const char* host, const char* path,
+ 
+     pthread_mutex_lock(&s_llm_lock);
+ 
+-    if (host && host[0]) {
+-        changed = changed || strcmp(s_llm_host, host) != 0;
++    if (host && host[0] && strcmp(s_llm_host, host) != 0) {
++        changed = true;
+         claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
+         strncpy(s_llm_host, host, sizeof(s_llm_host) - 1);
+         s_llm_host[sizeof(s_llm_host) - 1] = '\0';
+     }
+-    if (path && path[0]) {
+-        changed = changed || strcmp(s_llm_path, path) != 0;
++    if (path && path[0] && strcmp(s_llm_path, path) != 0) {
++        changed = true;
+         claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
+         strncpy(s_llm_path, path, sizeof(s_llm_path) - 1);
+         s_llm_path[sizeof(s_llm_path) - 1] = '\0';
+     }
+-    if (port && port[0]) {
+-        changed = changed || strcmp(s_llm_port, port) != 0;
++    if (port && port[0] && strcmp(s_llm_port, port) != 0) {
++        changed = true;
+         claw_config_set("llm_port", port);
+         strncpy(s_llm_port, port, sizeof(s_llm_port) - 1);
+         s_llm_port[sizeof(s_llm_port) - 1] = '\0';
+     }
+-    if (api_key && api_key[0]) {
+-        changed = changed || strcmp(s_api_key, api_key) != 0;
++    if (api_key && api_key[0] && strcmp(s_api_key, api_key) != 0) {
++        changed = true;
+         claw_config_set(AGENT_CFG_KEY_API_KEY, api_key);
+         strncpy(s_api_key, api_key, sizeof(s_api_key) - 1);
+         s_api_key[sizeof(s_api_key) - 1] = '\0';
+     }
+-    if (model && model[0]) {
+-        changed = changed || strcmp(s_model, model) != 0;
++    if (model && model[0] && strcmp(s_model, model) != 0) {
++        changed = true;
+         claw_config_set(AGENT_CFG_KEY_MODEL, model);
+         strncpy(s_model, model, sizeof(s_model) - 1);
+         s_model[sizeof(s_model) - 1] = '\0';
+@@ -797,7 +814,9 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     char api_key[128];
+     char llm_host[128];
+ 
+-    pthread_mutex_lock(&s_llm_lock);
++    if (llm_lock_config_snapshot() != OK) {
++        return ERROR;
++    }
+     memcpy(model, s_model, sizeof(model));
+     memcpy(api_key, s_api_key, sizeof(api_key));
+     memcpy(llm_host, s_llm_host, sizeof(llm_host));
+@@ -808,6 +827,9 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     }
+ 
+     cJSON* body = cJSON_CreateObject();
++    if (!body) {
++        return ERROR;
++    }
+ 
+     cJSON_AddStringToObject(body, "model",
+         model_name_for_api(model, llm_host));
+@@ -824,6 +846,13 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     cJSON* msgs = cJSON_Duplicate(messages, 1);
+     cJSON* sys_msg = cJSON_CreateObject();
+ 
++    if (!msgs || !sys_msg) {
++        cJSON_Delete(sys_msg);
++        cJSON_Delete(msgs);
++        cJSON_Delete(body);
++        return ERROR;
++    }
++
+     cJSON_AddStringToObject(sys_msg, "role", "system");
+     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
+     cJSON_InsertItemInArray(msgs, 0, sys_msg);
+diff --git a/packages/ai_agent/src/stubs.c b/packages/ai_agent/src/stubs.c
+index 186fe5be933c32119e46ed9c6bf5a82669c390da..d7d147523e75c181bd853b9ac986520f70464943 100644
+--- a/packages/ai_agent/src/stubs.c
++++ b/packages/ai_agent/src/stubs.c
+@@ -34,7 +34,7 @@ __attribute__((weak)) pid_t gettid(void) { return 0; }
+ __attribute__((weak)) void arm_netinitialize(void) { }
+ 
+ /* Voice channel stubs for sim build */
+-#ifndef CONFIG_MEDIA
++#if !defined(CONFIG_MEDIA) && !defined(CONFIG_EXAMPLES_AI_AGENT_VELA)
+ __attribute__((weak)) int voice_channel_init(void) { return 0; }
+ __attribute__((weak)) int voice_channel_start(void) { return -1; }
+ __attribute__((weak)) int voice_channel_stop(void) { return 0; }
+diff --git a/packages/ai_agent/src/voice/audio_capture.c b/packages/ai_agent/src/voice/audio_capture.c
+index f31e3880859172ee968c8b9b66158c15df8089d9..6f28baad3862070810481f0a3e0276c7023e7d3b 100644
+--- a/packages/ai_agent/src/voice/audio_capture.c
++++ b/packages/ai_agent/src/voice/audio_capture.c
+@@ -25,6 +25,14 @@
+ #include "voice/audio_capture.h"
+ #include "agent_config.h"
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++#include <arch/board/board.h>
++#include <nuttx/audio/audio.h>
++#include <nuttx/audio/i2s.h>
++#include <nuttx/clock.h>
++#include <nuttx/semaphore.h>
++#endif
++
+ #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
+ #include <aw-alsa-lib/pcm.h>
+ #endif
+@@ -53,6 +61,9 @@ static const char* TAG = "audio_cap";
+ enum audio_capture_backend {
+     AUDIO_CAPTURE_BACKEND_NONE = 0,
+     AUDIO_CAPTURE_BACKEND_ALSA,
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    AUDIO_CAPTURE_BACKEND_BOARD_I2S,
++#endif
+     AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER,
+ };
+ 
+@@ -72,6 +83,15 @@ struct audio_capture {
+     unsigned char* scratch;
+     size_t scratch_size;
+     int started;
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    struct i2s_dev_s* i2s;
++    sem_t i2s_done;
++    struct ap_buffer_s* i2s_apb;
++    size_t i2s_nbytes;
++    int i2s_result;
++    int i2s_pending;
++    size_t warmup_bytes;
++#endif
+ };
+ 
+ static audio_capture_t* s_active_capture;
+@@ -332,6 +352,146 @@ static int open_alsa_capture(audio_capture_t* cap, const char* dev_path,
+ 
+ #endif /* CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT */
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++
++#define BOARD_I2S_CAPTURE_BLOCK_BYTES 1024
++#define BOARD_I2S_CAPTURE_TIMEOUT_MS 1000
++#define BOARD_I2S_CAPTURE_WARMUP_BYTES 2048
++
++static void board_i2s_capture_done(struct i2s_dev_s* dev,
++    struct ap_buffer_s* apb, void* arg, int result)
++{
++    audio_capture_t* cap = arg;
++
++    (void)dev;
++    cap->i2s_nbytes = apb ? apb->nbytes : 0;
++    cap->i2s_result = result;
++    cap->i2s_pending = 0;
++    nxsem_post(&cap->i2s_done);
++}
++
++static int open_board_i2s_capture(audio_capture_t* cap,
++    unsigned int sample_rate, unsigned int channels,
++    unsigned int bits_per_sample)
++{
++    int actual;
++    int ret;
++
++    if (channels != 1 || bits_per_sample != 16) {
++        return -ENOTSUP;
++    }
++
++    cap->i2s = board_voice_mic_i2s();
++    if (!cap->i2s) {
++        return -ENODEV;
++    }
++
++    ret = I2S_RXCHANNELS(cap->i2s, channels);
++    if (ret < 0) {
++        return ret;
++    }
++
++    actual = (int)I2S_RXSAMPLERATE(cap->i2s, sample_rate);
++    if (actual != (int)sample_rate) {
++        return actual < 0 ? actual : -ENOTSUP;
++    }
++
++    actual = (int)I2S_RXDATAWIDTH(cap->i2s, bits_per_sample);
++    if (actual != (int)bits_per_sample) {
++        return actual < 0 ? actual : -ENOTSUP;
++    }
++
++    nxsem_init(&cap->i2s_done, 0, 0);
++    cap->backend = AUDIO_CAPTURE_BACKEND_BOARD_I2S;
++    cap->bits_per_sample = bits_per_sample;
++    cap->requested_channels = channels;
++    cap->hw_channels = channels;
++    cap->out_frame_bytes = (bits_per_sample / 8) * channels;
++    cap->hw_frame_bytes = cap->out_frame_bytes;
++    cap->warmup_bytes = BOARD_I2S_CAPTURE_WARMUP_BYTES;
++
++    syslog(LOG_INFO, "[%s] opened contest I2S capture (%uHz %uch %ubit)\n",
++        TAG, sample_rate, channels, bits_per_sample);
++    return 0;
++}
++
++static int board_i2s_read_block(audio_capture_t* cap, void* buf,
++    size_t cap_len, size_t* nbytes_out)
++{
++    struct audio_buf_desc_s desc;
++    struct ap_buffer_s* apb = NULL;
++    size_t request = cap_len;
++    int ret;
++
++    /* voice_channel_start() deliberately starts the reader thread before
++     * enabling the device.  Let that short hand-off window be retried by the
++     * reader instead of submitting to a stopped I2S stream (which returns
++     * -EBUSY from the contest lower half). */
++    if (!cap->started) {
++        return -EAGAIN;
++    }
++
++    if (request > BOARD_I2S_CAPTURE_BLOCK_BYTES) {
++        request = BOARD_I2S_CAPTURE_BLOCK_BYTES;
++    }
++    request -= request % cap->out_frame_bytes;
++    if (request == 0) {
++        return -EINVAL;
++    }
++
++    memset(&desc, 0, sizeof(desc));
++    desc.numbytes = request;
++    desc.u.pbuffer = &apb;
++    ret = apb_alloc(&desc);
++    if (ret < 0) {
++        return ret;
++    }
++
++    while (nxsem_trywait(&cap->i2s_done) == 0)
++        ;
++
++    cap->i2s_apb = apb;
++    cap->i2s_nbytes = 0;
++    cap->i2s_result = -EINPROGRESS;
++    cap->i2s_pending = 1;
++    ret = I2S_RECEIVE(cap->i2s, apb, board_i2s_capture_done, cap,
++        MSEC2TICK(BOARD_I2S_CAPTURE_TIMEOUT_MS));
++    if (ret < 0) {
++        cap->i2s_pending = 0;
++        cap->i2s_apb = NULL;
++        apb_free(apb);
++        return ret;
++    }
++
++    /* I2S completion owns the lower-half APB reference.  Do not release the
++     * application's reference on a timeout: a late callback would otherwise
++     * access a freed capture object.  audio_capture_abort() issues STOP,
++     * which completes this wait with the driver's cancellation result. */
++    ret = nxsem_wait_uninterruptible(&cap->i2s_done);
++
++    if (ret >= 0) {
++        ret = cap->i2s_result;
++    }
++
++    if (ret >= 0 && cap->i2s_nbytes > 0) {
++        size_t nbytes = cap->i2s_nbytes;
++
++        if (nbytes > request) {
++            ret = -EIO;
++        } else {
++            memcpy(buf, apb->samp, nbytes);
++            *nbytes_out = nbytes;
++        }
++    }
++
++    cap->i2s_pending = 0;
++    cap->i2s_apb = NULL;
++    apb_free(apb);
++    return ret;
++}
++
++#endif /* CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO */
++
+ static int open_media_recorder_capture(audio_capture_t* cap,
+     unsigned int sample_rate, unsigned int channels,
+     unsigned int bits_per_sample)
+@@ -399,6 +559,13 @@ audio_capture_t* audio_capture_open(const char* dev_path,
+     (void)dev_path;
+ #endif
+ 
++    if (ret < 0) {
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++        ret = open_board_i2s_capture(cap, sample_rate, channels,
++            bits_per_sample);
++#endif
++    }
++
+     if (ret < 0) {
+         ret = open_media_recorder_capture(cap, sample_rate, channels,
+             bits_per_sample);
+@@ -458,6 +625,24 @@ int audio_capture_start(audio_capture_t* cap)
+         return 0;
+     }
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    case AUDIO_CAPTURE_BACKEND_BOARD_I2S:
++        if (!cap->i2s) {
++            return -EINVAL;
++        }
++
++        if (cap->started) {
++            return 0;
++        }
++
++        if (I2S_IOCTL(cap->i2s, AUDIOIOC_START, 0) < 0) {
++            return -EIO;
++        }
++
++        cap->started = 1;
++        return 0;
++#endif
++
+     default:
+         return -EINVAL;
+     }
+@@ -536,6 +721,45 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
+         return (int)n;
+     }
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    case AUDIO_CAPTURE_BACKEND_BOARD_I2S: {
++        unsigned char* dst = buf;
++        size_t total = 0;
++
++        while (total < len) {
++            size_t nbytes = 0;
++            int ret = board_i2s_read_block(cap, dst + total, len - total,
++                &nbytes);
++
++            if (ret < 0) {
++                return total > 0 ? (int)total : ret;
++            }
++
++            if (nbytes == 0) {
++                return total > 0 ? (int)total : -EIO;
++            }
++
++            if (cap->warmup_bytes >= nbytes) {
++                cap->warmup_bytes -= nbytes;
++                continue;
++            }
++
++            if (cap->warmup_bytes > 0) {
++                size_t skip = cap->warmup_bytes;
++
++                memmove(dst + total, dst + total + skip, nbytes - skip);
++                nbytes -= skip;
++                cap->warmup_bytes = 0;
++            }
++
++            total += nbytes;
++        }
++
++        apply_capture_gain(buf, total);
++        return (int)total;
++    }
++#endif
++
+     default:
+         return -EINVAL;
+     }
+@@ -569,6 +793,15 @@ int audio_capture_abort(audio_capture_t* cap)
+         }
+         return 0;
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    case AUDIO_CAPTURE_BACKEND_BOARD_I2S:
++        if (cap->i2s && cap->started) {
++            cap->started = 0;
++            return I2S_IOCTL(cap->i2s, AUDIOIOC_STOP, 0);
++        }
++        return 0;
++#endif
++
+     default:
+         return -EINVAL;
+     }
+@@ -605,6 +838,17 @@ void audio_capture_close(audio_capture_t* cap)
+         }
+         break;
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    case AUDIO_CAPTURE_BACKEND_BOARD_I2S:
++        if (cap->i2s && cap->started) {
++            I2S_IOCTL(cap->i2s, AUDIOIOC_STOP, 0);
++            cap->started = 0;
++        }
++        nxsem_destroy(&cap->i2s_done);
++        cap->i2s = NULL;
++        break;
++#endif
++
+     default:
+         break;
+     }
+diff --git a/packages/ai_agent/src/voice/audio_playback.c b/packages/ai_agent/src/voice/audio_playback.c
+index 6a2089c7bd248eb759cca13d25e425d18cc54390..92d2386c6b3a493259bb6a9293a03dc0b16be1d2 100644
+--- a/packages/ai_agent/src/voice/audio_playback.c
++++ b/packages/ai_agent/src/voice/audio_playback.c
+@@ -14,11 +14,19 @@
+  * limitations under the License.
+  */
+ 
+-/* audio_playback.c - Streaming audio playback via media_player buffer mode. */
++/* audio_playback.c - PCM playback via board I2S or media_player. */
+ 
+ #include "voice/audio_playback.h"
+ #include "agent_config.h"
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++#include <arch/board/board.h>
++#include <nuttx/audio/audio.h>
++#include <nuttx/audio/i2s.h>
++#include <nuttx/clock.h>
++#include <nuttx/semaphore.h>
++#endif
++
+ #include <errno.h>
+ #include <media_player.h>
+ #include <stdio.h>
+@@ -31,32 +39,172 @@ static const char* TAG = "audio_pb";
+ 
+ #define PB_OPTIONS_LEN 128
+ 
+-static void* s_active_player;
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++#define BOARD_I2S_PLAYBACK_BLOCK_BYTES 2048
++#define BOARD_I2S_PLAYBACK_TIMEOUT_MS 1000
++#endif
++
++enum audio_playback_backend {
++    AUDIO_PLAYBACK_BACKEND_NONE = 0,
++    AUDIO_PLAYBACK_BACKEND_MEDIA_PLAYER,
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    AUDIO_PLAYBACK_BACKEND_BOARD_I2S,
++#endif
++};
+ 
+ struct audio_playback {
++    enum audio_playback_backend backend;
+     void* player;
+     size_t total_written;
+     int bytes_per_frame;
+     volatile int stopped;
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    struct i2s_dev_s* i2s;
++    sem_t i2s_done;
++    int i2s_result;
++    int i2s_pending;
++    int i2s_started;
++#endif
+ };
+ 
++static audio_playback_t* s_active_playback;
++
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++
++static void board_i2s_playback_done(struct i2s_dev_s* dev,
++    struct ap_buffer_s* apb, void* arg, int result)
++{
++    audio_playback_t* pb = arg;
++
++    (void)dev;
++    (void)apb;
++    pb->i2s_result = result;
++    pb->i2s_pending = 0;
++    nxsem_post(&pb->i2s_done);
++}
++
++static int open_board_i2s_playback(audio_playback_t* pb,
++    unsigned int sample_rate, unsigned int channels,
++    unsigned int bits_per_sample)
++{
++    int actual;
++    int ret;
++
++    if (channels != 1 || bits_per_sample != 16) {
++        return -ENOTSUP;
++    }
++
++    pb->i2s = board_voice_speaker_i2s();
++    if (!pb->i2s) {
++        return -ENODEV;
++    }
++
++    ret = I2S_TXCHANNELS(pb->i2s, channels);
++    if (ret < 0) {
++        return ret;
++    }
++
++    actual = (int)I2S_TXSAMPLERATE(pb->i2s, sample_rate);
++    if (actual != (int)sample_rate) {
++        return actual < 0 ? actual : -ENOTSUP;
++    }
++
++    actual = (int)I2S_TXDATAWIDTH(pb->i2s, bits_per_sample);
++    if (actual != (int)bits_per_sample) {
++        return actual < 0 ? actual : -ENOTSUP;
++    }
++
++    ret = I2S_IOCTL(pb->i2s, AUDIOIOC_START, 0);
++    if (ret < 0) {
++        return ret;
++    }
++
++    nxsem_init(&pb->i2s_done, 0, 0);
++    pb->backend = AUDIO_PLAYBACK_BACKEND_BOARD_I2S;
++    pb->i2s_started = 1;
++    syslog(LOG_INFO, "[%s] opened contest I2S playback (%uHz %uch %ubit)\n",
++        TAG, sample_rate, channels, bits_per_sample);
++    return 0;
++}
++
++static int board_i2s_write_block(audio_playback_t* pb,
++    const void* buf, size_t len)
++{
++    struct audio_buf_desc_s desc;
++    struct ap_buffer_s* apb = NULL;
++    int ret;
++
++    memset(&desc, 0, sizeof(desc));
++    desc.numbytes = len;
++    desc.u.pbuffer = &apb;
++    ret = apb_alloc(&desc);
++    if (ret < 0) {
++        return ret;
++    }
++
++    memcpy(apb->samp, buf, len);
++    apb->nbytes = len;
++    apb->nsamples = len / (size_t)pb->bytes_per_frame;
++
++    while (nxsem_trywait(&pb->i2s_done) == 0)
++        ;
++
++    pb->i2s_result = -EINPROGRESS;
++    pb->i2s_pending = 1;
++    ret = I2S_SEND(pb->i2s, apb, board_i2s_playback_done, pb,
++        MSEC2TICK(BOARD_I2S_PLAYBACK_TIMEOUT_MS));
++    if (ret >= 0) {
++        /* STOP from audio_playback_stop() completes this wait safely. */
++        ret = nxsem_wait_uninterruptible(&pb->i2s_done);
++        if (ret >= 0) {
++            ret = pb->i2s_result;
++        }
++    }
++
++    pb->i2s_pending = 0;
++    apb_free(apb);
++    return ret;
++}
++
++#endif /* CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO */
++
+ audio_playback_t* audio_playback_open(const char* dev_path,
+     unsigned int sample_rate, unsigned int channels,
+     unsigned int bits_per_sample)
+ {
++    audio_playback_t* pb;
++
+     (void)dev_path;
+ 
+-    if (s_active_player) {
+-        syslog(LOG_WARNING, "[%s] force closing stale player\n", TAG);
+-        media_player_stop(s_active_player);
+-        media_player_close(s_active_player, 0);
+-        s_active_player = NULL;
++    if (s_active_playback) {
++        syslog(LOG_WARNING, "[%s] force closing stale playback\n", TAG);
++        audio_playback_close(s_active_playback);
+         usleep(100000);
+     }
+ 
+-    void* player = media_player_open(MEDIA_STREAM_MUSIC);
+-    if (!player) {
++    pb = calloc(1, sizeof(*pb));
++    if (!pb) {
++        return NULL;
++    }
++
++    pb->bytes_per_frame = (bits_per_sample / 8) * channels;
++    if (pb->bytes_per_frame == 0) {
++        free(pb);
++        return NULL;
++    }
++
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    if (open_board_i2s_playback(pb, sample_rate, channels,
++            bits_per_sample) == 0) {
++        s_active_playback = pb;
++        return pb;
++    }
++#endif
++
++    pb->player = media_player_open(MEDIA_STREAM_MUSIC);
++    if (!pb->player) {
+         syslog(LOG_ERR, "[%s] media_player_open failed\n", TAG);
++        free(pb);
+         return NULL;
+     }
+ 
+@@ -66,38 +214,32 @@ audio_playback_t* audio_playback_open(const char* dev_path,
+         bits_per_sample, sample_rate,
+         (channels == 1) ? "mono" : "stereo");
+ 
+-    int ret = media_player_prepare(player, NULL, opts);
++    int ret = media_player_prepare(pb->player, NULL, opts);
+     if (ret < 0) {
+         syslog(LOG_ERR, "[%s] prepare failed: %d\n", TAG, ret);
+-        media_player_close(player, 0);
++        media_player_close(pb->player, 0);
++        free(pb);
+         return NULL;
+     }
+ 
+-    ret = media_player_start(player);
++    ret = media_player_start(pb->player);
+     if (ret < 0) {
+         syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
+-        media_player_close(player, 0);
+-        return NULL;
+-    }
+-
+-    audio_playback_t* pb = calloc(1, sizeof(*pb));
+-    if (!pb) {
+-        media_player_close(player, 0);
++        media_player_close(pb->player, 0);
++        free(pb);
+         return NULL;
+     }
+ 
+-    pb->player = player;
+-    pb->bytes_per_frame = (bits_per_sample / 8) * channels;
+-    s_active_player = player;
+-
+-    syslog(LOG_INFO, "[%s] opened (%uHz %uch %ubit)\n",
++    pb->backend = AUDIO_PLAYBACK_BACKEND_MEDIA_PLAYER;
++    s_active_playback = pb;
++    syslog(LOG_INFO, "[%s] opened media playback (%uHz %uch %ubit)\n",
+         TAG, sample_rate, channels, bits_per_sample);
+     return pb;
+ }
+ 
+ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
+ {
+-    if (!pb || !pb->player || !buf || len == 0) {
++    if (!pb || !buf || len == 0) {
+         return -EINVAL;
+     }
+ 
+@@ -105,6 +247,36 @@ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
+         return -ECANCELED;
+     }
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    if (pb->backend == AUDIO_PLAYBACK_BACKEND_BOARD_I2S) {
++        const unsigned char* src = buf;
++        size_t total = 0;
++
++        len -= len % (size_t)pb->bytes_per_frame;
++        while (total < len) {
++            size_t block = len - total;
++            int ret;
++
++            if (block > BOARD_I2S_PLAYBACK_BLOCK_BYTES) {
++                block = BOARD_I2S_PLAYBACK_BLOCK_BYTES;
++            }
++            block -= block % (size_t)pb->bytes_per_frame;
++            ret = board_i2s_write_block(pb, src + total, block);
++            if (ret < 0) {
++                return total > 0 ? (int)total : ret;
++            }
++            total += block;
++        }
++
++        pb->total_written += total;
++        return (int)total;
++    }
++#endif
++
++    if (pb->backend != AUDIO_PLAYBACK_BACKEND_MEDIA_PLAYER || !pb->player) {
++        return -EINVAL;
++    }
++
+     ssize_t n = media_player_write_data(pb->player, buf, len);
+     if (n > 0) {
+         pb->total_written += (size_t)n;
+@@ -115,11 +287,21 @@ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
+ 
+ void audio_playback_stop(audio_playback_t* pb)
+ {
+-    if (pb) {
+-        pb->stopped = 1;
+-        if (pb->player) {
+-            media_player_stop(pb->player);
+-        }
++    if (!pb) {
++        return;
++    }
++
++    pb->stopped = 1;
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    if (pb->backend == AUDIO_PLAYBACK_BACKEND_BOARD_I2S && pb->i2s
++        && pb->i2s_started) {
++        pb->i2s_started = 0;
++        I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
++        return;
++    }
++#endif
++    if (pb->backend == AUDIO_PLAYBACK_BACKEND_MEDIA_PLAYER && pb->player) {
++        media_player_stop(pb->player);
+     }
+ }
+ 
+@@ -129,14 +311,27 @@ void audio_playback_close(audio_playback_t* pb)
+         return;
+     }
+ 
+-    if (pb->player) {
+-        syslog(LOG_INFO, "[%s] closing (%zu bytes written)\n",
+-            TAG, pb->total_written);
++    syslog(LOG_INFO, "[%s] closing (%zu bytes written)\n",
++        TAG, pb->total_written);
++
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
++    if (pb->backend == AUDIO_PLAYBACK_BACKEND_BOARD_I2S) {
++        if (pb->i2s && pb->i2s_started) {
++            I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
++        }
++        nxsem_destroy(&pb->i2s_done);
++        pb->i2s = NULL;
++    }
++#endif
++    if (pb->backend == AUDIO_PLAYBACK_BACKEND_MEDIA_PLAYER && pb->player) {
+         media_player_stop(pb->player);
+         usleep(50 * 1000);
+         media_player_close(pb->player, 0);
+-        s_active_player = NULL;
++        pb->player = NULL;
+     }
+ 
++    if (s_active_playback == pb) {
++        s_active_playback = NULL;
++    }
+     free(pb);
+ }
+diff --git a/packages/ai_agent/src/voice/mimo_voice.c b/packages/ai_agent/src/voice/mimo_voice.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d3b7cf0735c19972543b7a80cd606334d7b955b
+--- /dev/null
++++ b/packages/ai_agent/src/voice/mimo_voice.c
+@@ -0,0 +1,693 @@
++/*
++ * Copyright (C) 2026 Xiaomi Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ */
++
++/* MiMo ASR/TTS backend using the validated OpenAI-compatible API format. */
++
++#include "voice/mimo_voice.h"
++#include "voice/voice_asr.h"
++#include "voice/voice_tts.h"
++#include "infra/config_store.h"
++#include "infra/vela_tls.h"
++#include "agent_config.h"
++
++#include "cJSON.h"
++#include "mbedtls/base64.h"
++#include <arch/irq.h>
++#include <nuttx/arch.h>
++#include <nuttx/sched.h>
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <syslog.h>
++
++static const char *TAG = "mimo_voice";
++
++#define MIMO_ASR_BACKEND_NAME "mimo-v2.5-asr"
++#define MIMO_TTS_BACKEND_NAME "mimo-v2.5-tts"
++#define MIMO_VOICE_GUARD 0xa5c35a3cU
++
++struct mimo_guard_buf {
++    unsigned char *raw;
++    unsigned char *data;
++    size_t cap;
++};
++
++static size_t mimo_stack_free(void)
++{
++    struct stackinfo_s info;
++    uintptr_t sp;
++    uintptr_t low;
++
++    if (nxsched_get_stackinfo(0, &info) < 0) {
++        return 0;
++    }
++
++    sp = (uintptr_t)up_getsp();
++    low = (uintptr_t)info.stack_alloc_ptr;
++    return sp > low ? sp - low : 0;
++}
++
++static int mimo_guard_alloc(struct mimo_guard_buf *buf, size_t cap)
++{
++    size_t total;
++
++    if (!buf || cap == 0 || cap > SIZE_MAX - 8) {
++        return -EINVAL;
++    }
++
++    total = cap + 8;
++    buf->raw = calloc(1, total);
++    if (!buf->raw) {
++        return -ENOMEM;
++    }
++
++    *(uint32_t *)buf->raw = MIMO_VOICE_GUARD;
++    *(uint32_t *)(buf->raw + 4 + cap) = MIMO_VOICE_GUARD;
++    buf->data = buf->raw + 4;
++    buf->cap = cap;
++    return 0;
++}
++
++static bool mimo_guard_ok(const struct mimo_guard_buf *buf)
++{
++    return buf && buf->raw && buf->data && buf->cap > 0
++        && *(const uint32_t *)buf->raw == MIMO_VOICE_GUARD
++        && *(const uint32_t *)(buf->data + buf->cap) == MIMO_VOICE_GUARD;
++}
++
++static void mimo_guard_free(struct mimo_guard_buf *buf)
++{
++    if (buf) {
++        free(buf->raw);
++        memset(buf, 0, sizeof(*buf));
++    }
++}
++
++static void mimo_voice_diag(const char *phase, const char *task,
++    const void *body, size_t body_len, size_t body_cap,
++    const void *response, size_t response_len, size_t response_cap)
++{
++    char task_name[32] = { 0 };
++
++    if (!task) {
++        if (pthread_getname_np(pthread_self(), task_name,
++                sizeof(task_name)) != 0 || task_name[0] == '\0') {
++            strncpy(task_name, "unknown", sizeof(task_name) - 1);
++        }
++        task = task_name;
++    }
++
++    syslog(LOG_INFO,
++        "[VOICE-DIAG] %s task=%s cpu=%d sp=%08lx stack_free=%zu body=%p body_len=%zu body_cap=%zu response=%p response_len=%zu response_cap=%zu\n",
++        phase, task, sched_getcpu(), (unsigned long)up_getsp(),
++        mimo_stack_free(), body, body_len, body_cap, response, response_len,
++        response_cap);
++}
++
++static void mimo_voice_guard_diag(const char *which, bool pass)
++{
++    syslog(LOG_INFO, "[VOICE-GUARD] %s %s\n", which,
++        pass ? "PASS" : "FAIL");
++}
++
++static int mimo_asr_done(int ret)
++{
++    syslog(LOG_INFO, "[VOICE-DIAG] asr_done rc=%d\n", ret);
++    return ret;
++}
++
++static uint32_t read_le32(const unsigned char *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
++        | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint16_t read_le16(const unsigned char *p)
++{
++    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++static void write_le16(unsigned char *p, uint16_t v)
++{
++    p[0] = (unsigned char)v;
++    p[1] = (unsigned char)(v >> 8);
++}
++
++static void write_le32(unsigned char *p, uint32_t v)
++{
++    p[0] = (unsigned char)v;
++    p[1] = (unsigned char)(v >> 8);
++    p[2] = (unsigned char)(v >> 16);
++    p[3] = (unsigned char)(v >> 24);
++}
++
++static int get_api_key(char *out, size_t cap)
++{
++    if (claw_config_get(AGENT_CFG_KEY_API_KEY, out, cap) == OK
++        && out[0] != '\0') {
++        return 0;
++    }
++
++    if (claw_config_get(AGENT_CFG_KEY_MIMO_API_KEY, out, cap) == OK
++        && out[0] != '\0') {
++        return 0;
++    }
++
++    out[0] = '\0';
++    return -ENOENT;
++}
++
++static void get_endpoint(char *host, size_t host_cap,
++                         char *path, size_t path_cap)
++{
++    strncpy(host, AGENT_MIMO_VOICE_HOST, host_cap - 1);
++    strncpy(path, AGENT_MIMO_VOICE_PATH, path_cap - 1);
++
++    /* ASR/TTS are served by the token-plan endpoint.  Do not inherit the
++     * general LLM host: older MiMo presets used api.xiaomimimo.com. */
++
++    host[host_cap - 1] = '\0';
++    path[path_cap - 1] = '\0';
++}
++
++static int post_mimo(const char *body, char *response, size_t response_cap)
++{
++    char key[256] = { 0 };
++    char host[128] = { 0 };
++    char path[128] = { 0 };
++    char auth[320];
++    vela_header_t headers[2];
++    int status;
++
++    if (get_api_key(key, sizeof(key)) < 0) {
++        syslog(LOG_ERR, "[%s] No API key; use set_llm or set_mimo_key\n", TAG);
++        return -EACCES;
++    }
++
++    get_endpoint(host, sizeof(host), path, sizeof(path));
++    snprintf(auth, sizeof(auth), "Bearer %s", key);
++    headers[0].name = "Authorization";
++    headers[0].value = auth;
++    headers[1].name = NULL;
++    headers[1].value = NULL;
++
++    status = vela_https_post_json(host, AGENT_MIMO_VOICE_PORT, path,
++        headers, body, response, response_cap);
++    memset(key, 0, sizeof(key));
++
++    if (status < 200 || status >= 300) {
++        syslog(LOG_ERR, "[%s] HTTPS request status=%d\n", TAG, status);
++        return status > 0 ? -EIO : status;
++    }
++
++    return 0;
++}
++
++static int make_wav(const unsigned char *pcm, size_t pcm_len,
++                    unsigned char **wav_out, size_t *wav_len)
++{
++    unsigned char *wav;
++
++    if (!pcm || !wav_out || !wav_len || pcm_len > UINT32_MAX - 44) {
++        return -EINVAL;
++    }
++
++    wav = malloc(pcm_len + 44);
++    if (!wav) {
++        return -ENOMEM;
++    }
++
++    memset(wav, 0, pcm_len + 44);
++    memcpy(wav, "RIFF", 4);
++    write_le32(wav + 4, (uint32_t)(pcm_len + 36));
++    memcpy(wav + 8, "WAVEfmt ", 8);
++    write_le32(wav + 16, 16);
++    write_le16(wav + 20, 1);
++    write_le16(wav + 22, AGENT_VOICE_CHANNELS);
++    write_le32(wav + 24, AGENT_VOICE_SAMPLE_RATE);
++    write_le32(wav + 28, AGENT_VOICE_SAMPLE_RATE
++        * AGENT_VOICE_CHANNELS * (AGENT_VOICE_BITS / 8));
++    write_le16(wav + 32, AGENT_VOICE_CHANNELS * (AGENT_VOICE_BITS / 8));
++    write_le16(wav + 34, AGENT_VOICE_BITS);
++    memcpy(wav + 36, "data", 4);
++    write_le32(wav + 40, (uint32_t)pcm_len);
++    memcpy(wav + 44, pcm, pcm_len);
++
++    *wav_out = wav;
++    *wav_len = pcm_len + 44;
++    return 0;
++}
++
++static int json_string(cJSON *root, const char *field,
++                       char *out, size_t cap)
++{
++    cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
++    cJSON *first;
++    cJSON *message;
++    cJSON *item;
++
++    if (!cJSON_IsArray(choices) || cJSON_GetArraySize(choices) < 1) {
++        return -EPROTO;
++    }
++    first = cJSON_GetArrayItem(choices, 0);
++    message = cJSON_GetObjectItemCaseSensitive(first, "message");
++    item = message ? cJSON_GetObjectItemCaseSensitive(message, field) : NULL;
++    if (!cJSON_IsString(item) || !item->valuestring) {
++        return -EPROTO;
++    }
++
++    strncpy(out, item->valuestring, cap - 1);
++    out[cap - 1] = '\0';
++    return 0;
++}
++
++static int json_audio_data(cJSON *root, const char **data_out)
++{
++    cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
++    cJSON *first;
++    cJSON *message;
++    cJSON *audio;
++    cJSON *data;
++
++    if (!cJSON_IsArray(choices) || cJSON_GetArraySize(choices) < 1) {
++        return -EPROTO;
++    }
++    first = cJSON_GetArrayItem(choices, 0);
++    message = cJSON_GetObjectItemCaseSensitive(first, "message");
++    audio = message ? cJSON_GetObjectItemCaseSensitive(message, "audio") : NULL;
++    data = audio ? cJSON_GetObjectItemCaseSensitive(audio, "data") : NULL;
++    if (!cJSON_IsString(data) || !data->valuestring
++        || data->valuestring[0] == '\0') {
++        return -EPROTO;
++    }
++
++    *data_out = data->valuestring;
++    return 0;
++}
++
++static int make_asr_body(const unsigned char *pcm, size_t pcm_len,
++                         char **body_out, size_t *body_len_out)
++{
++    unsigned char *wav = NULL;
++    size_t wav_len = 0;
++    size_t b64_cap;
++    size_t b64_len = 0;
++    char *b64 = NULL;
++    char *data_uri = NULL;
++    cJSON *root = NULL;
++    cJSON *messages;
++    cJSON *message;
++    cJSON *content;
++    cJSON *audio_item;
++    cJSON *audio;
++    char *body;
++    int ret;
++
++    ret = make_wav(pcm, pcm_len, &wav, &wav_len);
++    if (ret < 0) {
++        return ret;
++    }
++
++    b64_cap = ((wav_len + 2) / 3) * 4 + 1;
++    b64 = malloc(b64_cap);
++    if (!b64) {
++        free(wav);
++        return -ENOMEM;
++    }
++
++    /* The ESP mbedTLS implementation requires destination capacity for the
++     * encoded data plus its terminating NUL. */
++    ret = mbedtls_base64_encode((unsigned char *)b64, b64_cap,
++        &b64_len, wav, wav_len);
++    free(wav);
++    if (ret != 0) {
++        syslog(LOG_ERR, "[%s] WAV base64 encode failed: %d\n", TAG, ret);
++        free(b64);
++        return -EIO;
++    }
++    b64[b64_len] = '\0';
++
++    data_uri = malloc(b64_len + 24);
++    if (!data_uri) {
++        free(b64);
++        return -ENOMEM;
++    }
++    snprintf(data_uri, b64_len + 24, "data:audio/wav;base64,%s", b64);
++    free(b64);
++
++    root = cJSON_CreateObject();
++    messages = cJSON_CreateArray();
++    message = cJSON_CreateObject();
++    content = cJSON_CreateArray();
++    audio_item = cJSON_CreateObject();
++    audio = cJSON_CreateObject();
++    if (!root || !messages || !message || !content || !audio_item || !audio) {
++        cJSON_Delete(root);
++        cJSON_Delete(messages);
++        cJSON_Delete(message);
++        cJSON_Delete(content);
++        cJSON_Delete(audio_item);
++        cJSON_Delete(audio);
++        free(data_uri);
++        return -ENOMEM;
++    }
++
++    cJSON_AddStringToObject(root, "model", AGENT_MIMO_ASR_MODEL);
++    cJSON_AddStringToObject(message, "role", "user");
++    cJSON_AddStringToObject(audio_item, "type", "input_audio");
++    cJSON_AddStringToObject(audio, "data", data_uri);
++    cJSON_AddItemToObject(audio_item, "input_audio", audio);
++    cJSON_AddItemToArray(content, audio_item);
++    cJSON_AddItemToObject(message, "content", content);
++    cJSON_AddItemToArray(messages, message);
++    cJSON_AddItemToObject(root, "messages", messages);
++    cJSON_AddItemToObject(root, "asr_options", cJSON_CreateObject());
++    cJSON_AddStringToObject(cJSON_GetObjectItem(root, "asr_options"),
++        "language", "zh");
++
++    body = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    free(data_uri);
++    if (!body) {
++        return -ENOMEM;
++    }
++
++    *body_out = body;
++    *body_len_out = strlen(body);
++    return 0;
++}
++
++static int mimo_asr_init(void)
++{
++    char key[256] = { 0 };
++    int ret = get_api_key(key, sizeof(key));
++    memset(key, 0, sizeof(key));
++    if (ret < 0) {
++        syslog(LOG_WARNING, "[%s] ASR API key is not configured\n", TAG);
++    }
++    return 0;
++}
++
++static int mimo_asr_recognize(const unsigned char *pcm_data,
++                              size_t pcm_len,
++                              char *text_out,
++                              size_t text_cap)
++{
++    char *body = NULL;
++    struct mimo_guard_buf body_buf = { 0 };
++    size_t body_len = 0;
++    struct mimo_guard_buf response_buf = { 0 };
++    cJSON *root = NULL;
++    int ret;
++
++    syslog(LOG_INFO, "[VOICE-DIAG] asr_begin\n");
++    if (!pcm_data || pcm_len == 0 || !text_out || text_cap == 0) {
++        return mimo_asr_done(-EINVAL);
++    }
++    if (pcm_len > AGENT_MIMO_MAX_AUDIO_BYTES) {
++        return mimo_asr_done(-EFBIG);
++    }
++
++    ret = make_asr_body(pcm_data, pcm_len, &body, &body_len);
++    if (ret < 0) {
++        return mimo_asr_done(ret);
++    }
++    if (body_len == SIZE_MAX) {
++        free(body);
++        return mimo_asr_done(-EOVERFLOW);
++    }
++
++    ret = mimo_guard_alloc(&body_buf, body_len + 1);
++    if (ret < 0) {
++        free(body);
++        return mimo_asr_done(ret);
++    }
++    memcpy(body_buf.data, body, body_len + 1);
++    free(body);
++    body = (char *)body_buf.data;
++
++    ret = mimo_guard_alloc(&response_buf, AGENT_MIMO_HTTP_RESP_BYTES);
++    if (ret < 0) {
++        mimo_guard_free(&body_buf);
++        return mimo_asr_done(ret);
++    }
++
++    mimo_voice_guard_diag("body", mimo_guard_ok(&body_buf));
++    mimo_voice_guard_diag("response", mimo_guard_ok(&response_buf));
++    if (!mimo_guard_ok(&body_buf) || !mimo_guard_ok(&response_buf)) {
++        return mimo_asr_done(-EFAULT);
++    }
++    syslog(LOG_INFO, "[VOICE-DIAG] body_ready len=%zu cap=%zu\n",
++        body_len, body_buf.cap);
++    mimo_voice_diag("body_ready", NULL, body, body_len, body_buf.cap,
++        response_buf.data, 0, response_buf.cap);
++    mimo_voice_guard_diag("body", mimo_guard_ok(&body_buf));
++    mimo_voice_guard_diag("response", mimo_guard_ok(&response_buf));
++    if (!mimo_guard_ok(&body_buf) || !mimo_guard_ok(&response_buf)) {
++        return mimo_asr_done(-EFAULT);
++    }
++    mimo_voice_diag("before_transport", NULL, body, body_len,
++        body_buf.cap, response_buf.data, 0, response_buf.cap);
++    syslog(LOG_INFO, "[VOICE-DIAG] transport_enter body=%p body_len=%zu response=%p response_cap=%zu\n",
++        body, body_len, response_buf.data, response_buf.cap);
++
++    ret = post_mimo(body, (char *)response_buf.data, response_buf.cap);
++    size_t response_len = ret >= 0
++        ? strnlen((char *)response_buf.data, response_buf.cap) : 0;
++    syslog(LOG_INFO, "[VOICE-DIAG] transport_return rc=%d response_len=%zu\n",
++        ret, response_len);
++    mimo_voice_diag("after_transport", NULL, body, body_len, body_buf.cap,
++        response_buf.data, response_len, response_buf.cap);
++    mimo_voice_guard_diag("body", mimo_guard_ok(&body_buf));
++    mimo_voice_guard_diag("response", mimo_guard_ok(&response_buf));
++    if (!mimo_guard_ok(&body_buf) || !mimo_guard_ok(&response_buf)) {
++        return mimo_asr_done(-EFAULT);
++    }
++    mimo_guard_free(&body_buf);
++    if (ret < 0) {
++        mimo_guard_free(&response_buf);
++        return mimo_asr_done(ret);
++    }
++    if (response_len == response_buf.cap) {
++        mimo_guard_free(&response_buf);
++        return mimo_asr_done(-EOVERFLOW);
++    }
++
++    root = cJSON_Parse((char *)response_buf.data);
++    mimo_voice_guard_diag("response", mimo_guard_ok(&response_buf));
++    if (!mimo_guard_ok(&response_buf)) {
++        return mimo_asr_done(-EFAULT);
++    }
++    mimo_guard_free(&response_buf);
++    if (!root) {
++        return mimo_asr_done(-EPROTO);
++    }
++
++    ret = json_string(root, "content", text_out, text_cap);
++    cJSON_Delete(root);
++    if (ret == 0) {
++        syslog(LOG_INFO, "[%s] ASR recognized %zu bytes\n", TAG, pcm_len);
++    }
++    return mimo_asr_done(ret);
++}
++
++static int make_tts_body(const char *text, char **body_out)
++{
++    cJSON *root = cJSON_CreateObject();
++    cJSON *messages = cJSON_CreateArray();
++    cJSON *message = cJSON_CreateObject();
++    cJSON *audio = cJSON_CreateObject();
++    char *body;
++
++    if (!root || !messages || !message || !audio) {
++        cJSON_Delete(root);
++        cJSON_Delete(messages);
++        cJSON_Delete(message);
++        cJSON_Delete(audio);
++        return -ENOMEM;
++    }
++
++    cJSON_AddStringToObject(root, "model", AGENT_MIMO_TTS_MODEL);
++    cJSON_AddStringToObject(message, "role", "assistant");
++    cJSON_AddStringToObject(message, "content", text);
++    cJSON_AddItemToArray(messages, message);
++    cJSON_AddItemToObject(root, "messages", messages);
++    cJSON_AddStringToObject(audio, "format", "wav");
++    cJSON_AddStringToObject(audio, "voice", AGENT_MIMO_TTS_VOICE);
++    cJSON_AddItemToObject(root, "audio", audio);
++
++    body = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    if (!body) {
++        return -ENOMEM;
++    }
++    *body_out = body;
++    return 0;
++}
++
++static int extract_wav_pcm(const unsigned char *wav, size_t wav_len,
++                           unsigned char *pcm_out, size_t pcm_cap,
++                           size_t *pcm_len)
++{
++    size_t pos = 12;
++    uint32_t sample_rate = 0;
++    uint16_t channels = 0;
++    uint16_t bits = 0;
++    const unsigned char *data = NULL;
++    size_t data_len = 0;
++
++    if (wav_len < 44 || memcmp(wav, "RIFF", 4) != 0
++        || memcmp(wav + 8, "WAVE", 4) != 0) {
++        return -EPROTO;
++    }
++
++    while (pos + 8 <= wav_len) {
++        const unsigned char *chunk = wav + pos;
++        uint32_t chunk_len = read_le32(chunk + 4);
++        size_t next = pos + 8 + chunk_len + (chunk_len & 1U);
++        if (next > wav_len) {
++            return -EPROTO;
++        }
++        if (memcmp(chunk, "fmt ", 4) == 0 && chunk_len >= 16) {
++            const unsigned char *fmt = chunk + 8;
++            if (read_le16(fmt) != 1) {
++                return -ENOTSUP;
++            }
++            channels = read_le16(fmt + 2);
++            sample_rate = read_le32(fmt + 4);
++            bits = read_le16(fmt + 14);
++        } else if (memcmp(chunk, "data", 4) == 0) {
++            data = chunk + 8;
++            data_len = chunk_len;
++        }
++        pos = next;
++    }
++
++    if (!data || channels != 1 || bits != 16 || sample_rate == 0) {
++        return -EPROTO;
++    }
++    if (sample_rate != AGENT_MIMO_TTS_SAMPLE_RATE) {
++        syslog(LOG_ERR, "[%s] TTS sample rate %lu unsupported\n",
++            TAG, (unsigned long)sample_rate);
++        return -ENOTSUP;
++    }
++    if (data_len > pcm_cap) {
++        return -ENOSPC;
++    }
++
++    memcpy(pcm_out, data, data_len);
++    *pcm_len = data_len;
++    return 0;
++}
++
++static int mimo_tts_init(void)
++{
++    return mimo_asr_init();
++}
++
++static int mimo_tts_synthesize(const char *text,
++                               unsigned char *pcm_out,
++                               size_t pcm_cap,
++                               size_t *pcm_len)
++{
++    char *body = NULL;
++    char *response = NULL;
++    const char *audio_b64 = NULL;
++    unsigned char *wav = NULL;
++    size_t wav_cap;
++    size_t wav_len = 0;
++    size_t decoded_len = 0;
++    cJSON *root = NULL;
++    int ret;
++
++    if (!text || text[0] == '\0' || !pcm_out || !pcm_len) {
++        return -EINVAL;
++    }
++
++    ret = make_tts_body(text, &body);
++    if (ret < 0) {
++        return ret;
++    }
++    response = calloc(1, AGENT_MIMO_HTTP_RESP_BYTES);
++    if (!response) {
++        free(body);
++        return -ENOMEM;
++    }
++
++    ret = post_mimo(body, response, AGENT_MIMO_HTTP_RESP_BYTES);
++    free(body);
++    if (ret < 0) {
++        free(response);
++        return ret;
++    }
++
++    root = cJSON_Parse(response);
++    free(response);
++    if (!root) {
++        return -EPROTO;
++    }
++    ret = json_audio_data(root, &audio_b64);
++    if (ret < 0) {
++        cJSON_Delete(root);
++        return ret;
++    }
++
++    wav_cap = (strlen(audio_b64) * 3) / 4 + 4;
++    wav = malloc(wav_cap);
++    if (!wav) {
++        cJSON_Delete(root);
++        return -ENOMEM;
++    }
++    ret = mbedtls_base64_decode(wav, wav_cap, &wav_len,
++        (const unsigned char *)audio_b64, strlen(audio_b64));
++    cJSON_Delete(root);
++    if (ret != 0) {
++        free(wav);
++        return -EPROTO;
++    }
++
++    ret = extract_wav_pcm(wav, wav_len, pcm_out, pcm_cap, &decoded_len);
++    free(wav);
++    if (ret == 0) {
++        *pcm_len = decoded_len;
++        syslog(LOG_INFO, "[%s] TTS PCM bytes=%zu\n", TAG, decoded_len);
++    }
++    return ret;
++}
++
++static const voice_asr_ops_t s_mimo_asr_ops = {
++    .name = MIMO_ASR_BACKEND_NAME,
++    .init = mimo_asr_init,
++    .recognize = mimo_asr_recognize,
++    .stream_open = NULL,
++    .stream_send = NULL,
++    .stream_finish = NULL,
++    .stream_abort = NULL,
++    .deinit = NULL,
++};
++
++static const voice_tts_ops_t s_mimo_tts_ops = {
++    .name = MIMO_TTS_BACKEND_NAME,
++    .init = mimo_tts_init,
++    .synthesize = mimo_tts_synthesize,
++    .stream_synthesize = NULL,
++    .deinit = NULL,
++};
++
++int mimo_asr_register(void)
++{
++    return voice_asr_register(&s_mimo_asr_ops);
++}
++
++int mimo_tts_register(void)
++{
++    return voice_tts_register(&s_mimo_tts_ops);
++}
+diff --git a/packages/ai_agent/src/voice/voice_asr.c b/packages/ai_agent/src/voice/voice_asr.c
+index 4792bded76f19075290f1f8c7517de6395980f03..7089ce9270119e52dcc8573a66435d56d5ebea6b 100644
+--- a/packages/ai_agent/src/voice/voice_asr.c
++++ b/packages/ai_agent/src/voice/voice_asr.c
+@@ -15,7 +15,6 @@
+  */
+ 
+ #include "voice/voice_asr.h"
+-#include "voice/volc_asr.h"
+ 
+ #include <errno.h>
+ #include <stdlib.h>
+@@ -61,6 +60,11 @@ int voice_asr_set_backend(const char* name)
+         return -EINVAL;
+     }
+ 
++    /* Keep the short name for compatibility with older images. */
++    if (strcmp(name, "mimo") == 0) {
++        name = "mimo-v2.5-asr";
++    }
++
+     for (int i = 0; i < s_backend_count; i++) {
+         if (strcmp(s_backends[i]->name, name) == 0) {
+             if (s_active && s_active->deinit) {
+@@ -87,6 +91,12 @@ const char* voice_asr_get_backend(void)
+     return s_active ? s_active->name : NULL;
+ }
+ 
++int voice_asr_supports_streaming(void)
++{
++    return s_active && s_active->stream_open && s_active->stream_send
++        && s_active->stream_finish && s_active->stream_abort;
++}
++
+ int voice_asr_recognize(const unsigned char* pcm_data,
+     size_t pcm_len,
+     char* text_out,
+@@ -103,17 +113,18 @@ int voice_asr_recognize(const unsigned char* pcm_data,
+ /* ── Streaming ASR (delegates to volc_asr streaming API) ─────── */
+ 
+ struct voice_asr_stream {
+-    volc_asr_stream_t* inner;
++    const voice_asr_ops_t *ops;
++    void *inner;
+ };
+ 
+ voice_asr_stream_t* voice_asr_stream_open(void)
+ {
+-    if (!s_active) {
+-        syslog(LOG_ERR, "[%s] No ASR backend for streaming\n", TAG);
++    if (!voice_asr_supports_streaming()) {
++        syslog(LOG_INFO, "[%s] Active backend is batch-only\n", TAG);
+         return NULL;
+     }
+ 
+-    volc_asr_stream_t* inner = volc_asr_stream_open();
++    void *inner = s_active->stream_open();
+ 
+     if (!inner) {
+         return NULL;
+@@ -122,10 +133,11 @@ voice_asr_stream_t* voice_asr_stream_open(void)
+     voice_asr_stream_t* s = calloc(1, sizeof(*s));
+ 
+     if (!s) {
+-        volc_asr_stream_abort(inner);
++        s_active->stream_abort(inner);
+         return NULL;
+     }
+ 
++    s->ops = s_active;
+     s->inner = inner;
+     return s;
+ }
+@@ -133,11 +145,11 @@ voice_asr_stream_t* voice_asr_stream_open(void)
+ int voice_asr_stream_send(voice_asr_stream_t* s,
+     const unsigned char* pcm, size_t len)
+ {
+-    if (!s || !s->inner) {
++    if (!s || !s->ops || !s->inner) {
+         return -EINVAL;
+     }
+ 
+-    return volc_asr_stream_send(s->inner, pcm, len);
++    return s->ops->stream_send(s->inner, pcm, len);
+ }
+ 
+ int voice_asr_stream_finish(voice_asr_stream_t* s,
+@@ -147,7 +159,7 @@ int voice_asr_stream_finish(voice_asr_stream_t* s,
+         return -EINVAL;
+     }
+ 
+-    int ret = volc_asr_stream_finish(s->inner, text_out, text_cap);
++    int ret = s->ops->stream_finish(s->inner, text_out, text_cap);
+ 
+     /* s->inner is freed by volc_asr_stream_finish */
+     free(s);
+@@ -160,6 +172,8 @@ void voice_asr_stream_abort(voice_asr_stream_t* s)
+         return;
+     }
+ 
+-    volc_asr_stream_abort(s->inner);
++    if (s->ops && s->ops->stream_abort) {
++        s->ops->stream_abort(s->inner);
++    }
+     free(s);
+ }
+diff --git a/packages/ai_agent/src/voice/voice_channel.c b/packages/ai_agent/src/voice/voice_channel.c
+index 8487250b0665e9dd580897839f382d7df735fe4e..4a91a731e351c6d10ad1ffd1f8c7cfdea5012824 100644
+--- a/packages/ai_agent/src/voice/voice_channel.c
++++ b/packages/ai_agent/src/voice/voice_channel.c
+@@ -28,6 +28,7 @@
+ #include "voice/audio_playback.h"
+ #include "voice/voice_asr.h"
+ #include "voice/voice_tts.h"
++#include "voice/mimo_voice.h"
+ #include "voice/volc_asr.h"
+ #include "voice/volc_tts.h"
+ 
+@@ -45,6 +46,30 @@
+ static const char* TAG = "voice";
+ static int s_backends_registered;
+ 
++static int dispatch_voice_text(const char *text)
++{
++    agent_msg_t msg;
++
++    if (!text || text[0] == '\0') {
++        return 0;
++    }
++
++    memset(&msg, 0, sizeof(msg));
++    strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
++    strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
++    msg.content = strdup(text);
++    if (!msg.content) {
++        return -ENOMEM;
++    }
++
++    if (message_bus_push_inbound(&msg) < 0) {
++        free(msg.content);
++        return -EAGAIN;
++    }
++
++    return 0;
++}
++
+ /* ── Audio preprocessing (NS + AGC via BES ec2float) ────── */
+ 
+ #ifdef CONFIG_AI_AGENT_AUDIO_PREPROCESS
+@@ -213,6 +238,7 @@ static struct {
+     size_t pcm_cap; /* buffer capacity */
+     pthread_t rec_thread;
+     voice_asr_stream_t* asr_stream; /* streaming ASR handle */
++    bool asr_pending; /* batch ASR worker owns a completed recording */
+     sem_t rec_ready; /* posted by recording_thread when ready to consume */
+     volatile int tts_abort; /* set to 1 to stop active TTS playback */
+     audio_playback_t* tts_pb; /* active TTS playback handle (or NULL) */
+@@ -392,10 +418,11 @@ static void* recording_thread(void* arg)
+     pthread_mutex_unlock(&s_voice.lock);
+ 
+     if (!stream) {
+-        /* No pre-connected stream — open now (may lose first 300-800ms) */
+-        stream = voice_asr_stream_open();
+-        syslog(LOG_WARNING,
+-            "[%s] streaming ASR unavailable, batch fallback\n", TAG);
++        /* Batch-only backends accumulate PCM and recognize at stop. */
++        if (voice_asr_supports_streaming()) {
++            stream = voice_asr_stream_open();
++        }
++        syslog(LOG_INFO, "[%s] recording with batch ASR fallback\n", TAG);
+         need_fallback = 1;
+ 
+         pthread_mutex_lock(&s_voice.lock);
+@@ -531,23 +558,16 @@ static void* asr_and_dispatch(void* arg)
+         syslog(LOG_INFO, "[%s] ASR result: %s\n", TAG, text);
+         printf("ASR: %s\n", text);
+ 
+-        agent_msg_t msg;
+-
+-        memset(&msg, 0, sizeof(msg));
+-        strncpy(msg.channel, AGENT_CHAN_VOICE,
+-            sizeof(msg.channel) - 1);
+-        strncpy(msg.chat_id, "voice",
+-            sizeof(msg.chat_id) - 1);
+-        msg.content = strdup(text);
+-        if (msg.content) {
+-            message_bus_push_inbound(&msg);
+-        }
++        dispatch_voice_text(text);
+     } else {
+         syslog(LOG_WARNING, "[%s] ASR failed or empty: %d\n",
+             TAG, ret);
+     }
+ 
+     free(pcm);
++    pthread_mutex_lock(&s_voice.lock);
++    s_voice.asr_pending = false;
++    pthread_mutex_unlock(&s_voice.lock);
+     return NULL;
+ }
+ 
+@@ -596,11 +616,16 @@ int voice_channel_init(void)
+     s_voice.pcm_buf = NULL;
+     s_voice.pcm_len = 0;
+     s_voice.asr_stream = NULL;
++    s_voice.asr_pending = false;
+     s_voice.tts_abort = 0;
+     s_voice.tts_pb = NULL;
+     sem_init(&s_voice.rec_ready, 0, 0);
+ 
+     if (!s_backends_registered) {
++        /* MiMo is the default backend for the contest voice path. */
++        mimo_tts_register();
++        mimo_asr_register();
++        /* Keep Volcengine available for compatibility and fallback. */
+         volc_tts_register();
+         volc_asr_register();
+         s_backends_registered = 1;
+@@ -609,12 +634,45 @@ int voice_channel_init(void)
+     return 0;
+ }
+ 
++int voice_channel_process_pcm(const unsigned char *pcm_data,
++                              size_t pcm_len,
++                              char *text_out,
++                              size_t text_cap)
++{
++    int ret;
++
++    if (!pcm_data || pcm_len == 0 || !text_out || text_cap == 0) {
++        return -EINVAL;
++    }
++
++    text_out[0] = '\0';
++    if (!voice_asr_get_backend()) {
++        ret = voice_channel_init();
++        if (ret < 0) {
++            return ret;
++        }
++    }
++
++    ret = voice_asr_recognize(pcm_data, pcm_len, text_out, text_cap);
++    if (ret < 0) {
++        return ret;
++    }
++
++    if (text_out[0] != '\0') {
++        ret = dispatch_voice_text(text_out);
++        if (ret < 0) {
++            return ret;
++        }
++    }
++    return 0;
++}
++
+ int voice_channel_start(void)
+ {
+     pthread_mutex_lock(&s_voice.lock);
+-    if (s_voice.state != VOICE_IDLE) {
++    if (s_voice.state != VOICE_IDLE || s_voice.asr_pending) {
+         pthread_mutex_unlock(&s_voice.lock);
+-        syslog(LOG_WARNING, "[%s] already recording\n", TAG);
++        syslog(LOG_WARNING, "[%s] voice request already in progress\n", TAG);
+         return -EBUSY;
+     }
+ 
+@@ -671,10 +729,13 @@ int voice_channel_start(void)
+      * the first 300-800ms of speech to be lost.
+      *
+      * If the pre-open fails we fall back to batch mode as before. */
+-    voice_asr_stream_t* pre_stream = voice_asr_stream_open();
++    voice_asr_stream_t* pre_stream = NULL;
++
++    if (voice_asr_supports_streaming()) {
++        pre_stream = voice_asr_stream_open();
++    }
+     if (!pre_stream) {
+-        syslog(LOG_WARNING,
+-            "[%s] pre-open ASR failed, will retry in thread\n", TAG);
++        syslog(LOG_INFO, "[%s] ASR batch mode selected\n", TAG);
+     } else {
+         syslog(LOG_INFO, "[%s] ASR pre-connected\n", TAG);
+         s_voice.asr_stream = pre_stream;
+@@ -752,6 +813,23 @@ int voice_channel_start(void)
+     return 0;
+ }
+ 
++int voice_channel_record_once(unsigned int duration_ms)
++{
++    int ret;
++
++    if (duration_ms == 0 || duration_ms > 30000) {
++        return -EINVAL;
++    }
++
++    ret = voice_channel_start();
++    if (ret < 0) {
++        return ret;
++    }
++
++    usleep((useconds_t)duration_ms * 1000U);
++    return voice_channel_stop();
++}
++
+ int voice_channel_stop(void)
+ {
+     pthread_mutex_lock(&s_voice.lock);
+@@ -776,6 +854,7 @@ int voice_channel_stop(void)
+     voice_asr_stream_t* stream = s_voice.asr_stream;
+     s_voice.asr_stream = NULL;
+     s_voice.state = VOICE_IDLE;
++    s_voice.asr_pending = stream == NULL && pcm_len > 0;
+     pthread_mutex_unlock(&s_voice.lock);
+ 
+     syslog(LOG_INFO, "[%s] recorded %zu bytes (stream=%p)\n",
+@@ -827,6 +906,9 @@ int voice_channel_stop(void)
+     if (!s_voice.pcm_buf || pcm_len == 0) {
+         free(s_voice.pcm_buf);
+         s_voice.pcm_buf = NULL;
++        pthread_mutex_lock(&s_voice.lock);
++        s_voice.asr_pending = false;
++        pthread_mutex_unlock(&s_voice.lock);
+         syslog(LOG_ERR, "[%s] no PCM data for batch ASR\n", TAG);
+         return -ENODATA;
+     }
+@@ -838,6 +920,9 @@ int voice_channel_stop(void)
+     if (!pkg) {
+         free(s_voice.pcm_buf);
+         s_voice.pcm_buf = NULL;
++        pthread_mutex_lock(&s_voice.lock);
++        s_voice.asr_pending = false;
++        pthread_mutex_unlock(&s_voice.lock);
+         return -ENOMEM;
+     }
+ 
+@@ -852,6 +937,9 @@ int voice_channel_stop(void)
+ 
+     if (ret != OK) {
+         free(pkg);
++        pthread_mutex_lock(&s_voice.lock);
++        s_voice.asr_pending = false;
++        pthread_mutex_unlock(&s_voice.lock);
+         return -EIO;
+     }
+ 
+diff --git a/packages/ai_agent/src/voice/voice_channel.h b/packages/ai_agent/src/voice/voice_channel.h
+index 71809a2b6078e05e91af9adb8ff12d7f306d71b1..59ab99f48cb96ac0d21ac1496ed2350593bf54f3 100644
+--- a/packages/ai_agent/src/voice/voice_channel.h
++++ b/packages/ai_agent/src/voice/voice_channel.h
+@@ -28,6 +28,9 @@ int voice_channel_init(void);
+ /* Start voice recording, ASR, then push text to agent via message_bus. */
+ int voice_channel_start(void);
+ 
++/* Record one fixed-duration utterance and dispatch it through message_bus. */
++int voice_channel_record_once(unsigned int duration_ms);
++
+ /* Stop an active voice session. */
+ int voice_channel_stop(void);
+ 
+@@ -46,6 +49,12 @@ int voice_channel_test_tts(const char *text, const char *out_path);
+ /* Test ASR: read PCM file, recognize, print result. */
+ int voice_channel_test_asr(const char *pcm_path);
+ 
++/* Recognize one PCM buffer and dispatch the text to the agent message bus. */
++int voice_channel_process_pcm(const unsigned char *pcm_data,
++                             size_t pcm_len,
++                             char *text_out,
++                             size_t text_cap);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/packages/ai_agent/src/voice/voice_tts.c b/packages/ai_agent/src/voice/voice_tts.c
+index 1eccad7d37b737b252ad4878e5a16039081e1442..5a532e61c8d23b256785a9e00c625cf704689a54 100644
+--- a/packages/ai_agent/src/voice/voice_tts.c
++++ b/packages/ai_agent/src/voice/voice_tts.c
+@@ -16,8 +16,10 @@
+ 
+ #include "voice/voice_tts.h"
+ #include "voice/volc_tts.h"
++#include "agent_config.h"
+ 
+ #include <errno.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <syslog.h>
+ 
+@@ -60,6 +62,11 @@ int voice_tts_set_backend(const char* name)
+         return -EINVAL;
+     }
+ 
++    /* Keep the short name for compatibility with older images. */
++    if (strcmp(name, "mimo") == 0) {
++        name = "mimo-v2.5-tts";
++    }
++
+     for (int i = 0; i < s_backend_count; i++) {
+         if (strcmp(s_backends[i]->name, name) == 0) {
+             if (s_active && s_active->deinit) {
+@@ -110,6 +117,22 @@ int voice_tts_speak_stream(const char* text,
+         return -ENODEV;
+     }
+ 
+-    return volc_tts_ws_synthesize_stream(text,
+-        (volc_tts_chunk_cb)cb, user_data);
++    if (s_active->stream_synthesize) {
++        return s_active->stream_synthesize(text, cb, user_data);
++    }
++
++    /* Batch-only backends are delivered as one PCM chunk. */
++    unsigned char *pcm = malloc(AGENT_VOICE_RESP_BUF_SIZE);
++    size_t pcm_len = 0;
++    if (!pcm) {
++        return -ENOMEM;
++    }
++
++    int ret = s_active->synthesize(text, pcm,
++        AGENT_VOICE_RESP_BUF_SIZE, &pcm_len);
++    if (ret == 0 && pcm_len > 0 && cb) {
++        cb(pcm, pcm_len, 1, user_data);
++    }
++    free(pcm);
++    return ret;
+ }
+diff --git a/packages/ai_agent/src/voice/volc_asr.c b/packages/ai_agent/src/voice/volc_asr.c
+index ee8dc4af7279097a93ef6c457646b0b6993b6766..2d77ef1ba9d359773459bcf69dcd5f1dbf76db2c 100644
+--- a/packages/ai_agent/src/voice/volc_asr.c
++++ b/packages/ai_agent/src/voice/volc_asr.c
+@@ -1093,10 +1093,37 @@ static int volc_asr_recognize_ops(const unsigned char* pcm_data,
+ }
+ 
+ /* Backend ops registration */
++static void *volc_stream_open_adapter(void)
++{
++    return volc_asr_stream_open();
++}
++
++static int volc_stream_send_adapter(void *stream,
++    const unsigned char *pcm, size_t len)
++{
++    return volc_asr_stream_send((volc_asr_stream_t *)stream, pcm, len);
++}
++
++static int volc_stream_finish_adapter(void *stream,
++    char *text_out, size_t text_cap)
++{
++    return volc_asr_stream_finish((volc_asr_stream_t *)stream,
++        text_out, text_cap);
++}
++
++static void volc_stream_abort_adapter(void *stream)
++{
++    volc_asr_stream_abort((volc_asr_stream_t *)stream);
++}
++
+ static const voice_asr_ops_t s_volc_asr_ops = {
+     .name = "volcengine",
+     .init = volc_asr_init,
+     .recognize = volc_asr_recognize_ops,
++    .stream_open = volc_stream_open_adapter,
++    .stream_send = volc_stream_send_adapter,
++    .stream_finish = volc_stream_finish_adapter,
++    .stream_abort = volc_stream_abort_adapter,
+     .deinit = NULL,
+ };
+ 
+diff --git a/packages/ai_agent/src/voice/volc_tts.c b/packages/ai_agent/src/voice/volc_tts.c
+index 020181ea30112381a2fc0a5c5bf51e9b260761bf..44d07e3c7a44eda69dcb57401aec2bd6af78de4d 100644
+--- a/packages/ai_agent/src/voice/volc_tts.c
++++ b/packages/ai_agent/src/voice/volc_tts.c
+@@ -435,6 +435,7 @@ static const voice_tts_ops_t s_volc_tts_ops = {
+     .name = "volcengine",
+     .init = volc_tts_init,
+     .synthesize = volc_tts_synthesize,
++    .stream_synthesize = volc_tts_ws_synthesize_stream,
+     .deinit = NULL,
+ };
+ 

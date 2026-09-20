@@ -1,0 +1,43 @@
+############################################################################
+# board/contest_board/scripts/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+############################################################################
+
+# Keep NuttX's ESP HAL revision at 9fc713a95b1ff150dd0b0647e465d3c624056bb1.
+# The board build wrapper applies patches/0001-esp-hal-nuttx-lock-initializer.patch
+# before configuring and reverses it after the build.  Do not run shell patch
+# commands while this file is parsed: Make has no reliable post-build cleanup.
+
+include $(TOPDIR)/.config
+include $(TOPDIR)/tools/Config.mk
+include $(TOPDIR)/tools/esp32s3/Config.mk
+include $(TOPDIR)/arch/xtensa/src/lx7/Toolchain.defs
+
+ARCHSCRIPT += $(BOARD_COMMON_DIR)$(DELIM)scripts$(DELIM)esp32s3_peripherals.ld
+ARCHSCRIPT += $(BOARD_COMMON_DIR)$(DELIM)scripts$(DELIM)esp32s3_rom_aliases.ld
+
+ifeq ($(CONFIG_BUILD_PROTECTED),y)
+  ARCHSCRIPT += $(call FINDSCRIPT,protected_memory.ld)
+  ARCHSCRIPT += $(call FINDSCRIPT,kernel-space.ld)
+else
+  ARCHSCRIPT += $(call FINDSCRIPT,flat_memory.ld)
+  ifneq ($(CONFIG_ESP32S3_APP_FORMAT_LEGACY),y)
+    ARCHSCRIPT += $(call FINDSCRIPT,esp32s3_sections.ld)
+  else
+    ARCHSCRIPT += $(call FINDSCRIPT,legacy_sections.ld)
+  endif
+endif
+
+ifneq ($(CONFIG_DEBUG_NOOPT),y)
+  ARCHOPTIMIZATION += -fno-strength-reduce
+endif
+
+ARCHPICFLAGS = -fpic
+
+CFLAGS := $(ARCHCFLAGS) $(ARCHOPTIMIZATION) $(ARCHCPUFLAGS) $(ARCHINCLUDES) $(ARCHDEFINES) $(EXTRAFLAGS)
+CPICFLAGS = $(ARCHPICFLAGS) $(CFLAGS)
+CXXFLAGS := $(ARCHCXXFLAGS) $(ARCHOPTIMIZATION) $(ARCHCPUFLAGS) $(ARCHXXINCLUDES) $(ARCHDEFINES) $(EXTRAFLAGS)
+CXXPICFLAGS = $(ARCHPICFLAGS) $(CXXFLAGS)
+CPPFLAGS := $(ARCHINCLUDES) $(ARCHDEFINES) $(EXTRAFLAGS)
+AFLAGS := $(CFLAGS) -D__ASSEMBLY__

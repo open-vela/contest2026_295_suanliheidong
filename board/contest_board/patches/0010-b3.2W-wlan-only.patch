@@ -1,0 +1,203 @@
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -539,7 +539,7 @@
+ 
+     g_shutdown_requested = false;
+ 
+-    syslog(LOG_INFO, "[B3-DIAG] build=b3.1-message-bus-gate\n");
++    syslog(LOG_INFO, "[B3-DIAG] build=b3.2W-wlan-only\n");
+ 
+     struct timespec t0;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+@@ -593,6 +593,8 @@
+         if (rc != OK)
+             return -1;
+ 
++        network_sanitize_wlan0();
++
+         rc = memory_store_init();
+         BOOT_LOG_RC(&t0, "P1", "memory_store_init", rc);
+ 
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -1254,7 +1254,9 @@
+         complexity = llm_router_estimate_complexity(
+             msg->content, strlen(msg->content));
+     }
++    syslog(LOG_INFO, "[LLM-GATE] 1 router_enter\n");
+     int router_idx = llm_router_select(complexity);
++    syslog(LOG_INFO, "[LLM-GATE] 2 backend_selected idx=%d\n", router_idx);
+     if (router_idx >= 0) {
+         llm_router_apply(router_idx);
+     }
+--- a/src/infra/network_manager.c
++++ b/src/infra/network_manager.c
+@@ -18,6 +18,7 @@
+ #include "agent_compat.h"
+ 
+ #include <arpa/inet.h>
++#include <errno.h>
+ #include <ifaddrs.h>
+ #include <netinet/in.h>
+ #include <string.h>
+@@ -26,10 +27,61 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++#if !defined(CONFIG_ARCH_CHIP_GOLDFISH_ARM64) && \
++    !defined(CONFIG_ARCH_CHIP_QEMU_ARM) && \
++    !defined(CONFIG_AI_AGENT_NET_RPMSG)
++#include <netutils/netlib.h>
++#include <wireless/wapi.h>
++#endif
++
+ static const char* TAG = "netmgr";
+ 
+ static char s_ip_str[INET_ADDRSTRLEN] = "0.0.0.0";
+ 
++void network_sanitize_wlan0(void)
++{
++#if !defined(CONFIG_ARCH_CHIP_GOLDFISH_ARM64) && \
++    !defined(CONFIG_ARCH_CHIP_QEMU_ARM) && \
++    !defined(CONFIG_AI_AGENT_NET_RPMSG)
++    const char* dev = "wlan0";
++    int fd = wapi_make_socket();
++    int disconnect_rc = 0;
++    int disconnect_errno = 0;
++    int clear_rc = ERROR;
++    int clear_errno = 0;
++
++    if (fd < 0) {
++        disconnect_rc = fd;
++        disconnect_errno = -fd;
++        clear_rc = fd;
++        clear_errno = -fd;
++    } else {
++        /* This is the same WAPI disconnect implementation used by the
++         * `wapi disconnect wlan0` command.  Its public API is void, so the
++         * command's ioctl failures are reported by WAPI itself; the local
++         * return value records socket setup status only. */
++        errno = 0;
++        wpa_driver_wext_disconnect(fd, dev);
++        disconnect_errno = errno;
++
++        struct in_addr zero = { 0 };
++        clear_rc = wapi_set_ip(fd, dev, &zero);
++        clear_errno = clear_rc < 0 ? -clear_rc : 0;
++        close(fd);
++    }
++
++    syslog(LOG_INFO, "[WLAN-INIT] disconnect rc=%d errno=%d\n",
++        disconnect_rc, disconnect_errno);
++    syslog(LOG_INFO, "[WLAN-INIT] clear_ip rc=%d errno=%d\n",
++        clear_rc, clear_errno);
++#else
++    syslog(LOG_INFO, "[WLAN-INIT] disconnect rc=0 errno=0\n");
++    syslog(LOG_INFO, "[WLAN-INIT] clear_ip rc=0 errno=0\n");
++#endif
++
++    syslog(LOG_INFO, "[WLAN-INIT] sanitize done\n");
++}
++
+ bool network_is_connected(void)
+ {
+     struct ifaddrs* ifa_list = NULL;
+--- a/src/infra/network_manager.h
++++ b/src/infra/network_manager.h
+@@ -48,6 +48,9 @@
+ /** Re-connect using credentials saved in config_store (called at startup). */
+ int network_wifi_reconnect(void);
+ 
++/** Clear stale wlan0 runtime link and IPv4 state before startup reconnect. */
++void network_sanitize_wlan0(void);
++
+ /* ── RPMSG/TUN network interface ──────────────────────────────── */
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+ 
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -694,6 +694,8 @@
+     const char* tools_json, llm_response_t* resp)
+ {
+     memset(resp, 0, sizeof(*resp));
++
++    syslog(LOG_INFO, "[LLM-GATE] 4 proxy_enter\n");
+     s_diag_last_status = 0;
+     s_diag_last_stage = "router";
+ 
+@@ -708,10 +710,26 @@
+     memcpy(llm_host, s_llm_host, sizeof(llm_host));
+     pthread_mutex_unlock(&s_llm_lock);
+ 
++    size_t model_len = strnlen(model, sizeof(model));
++    size_t key_len = strnlen(api_key, sizeof(api_key));
++    size_t host_len = strnlen(llm_host, sizeof(llm_host));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config_snapshot host_ptr=%p host_len=%zu "
++        "model_ptr=%p model_len=%zu key_ptr=%p key_len=%zu\n",
++        (void*)llm_host, host_len, (void*)model, model_len,
++        (void*)api_key, key_len);
++
++    if (model_len >= sizeof(model) || key_len >= sizeof(api_key)
++        || host_len >= sizeof(llm_host)) {
++        syslog(LOG_ERR, "[LLM-GATE] config snapshot unterminated\n");
++        return ERROR;
++    }
++
+     if (api_key[0] == '\0') {
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 5 request_build_begin\n");
+     cJSON* body = cJSON_CreateObject();
+     if (!body) {
+         syslog(LOG_ERR, "[AI-DOG-DIAG] llm request body allocation failed\n");
+@@ -773,6 +791,9 @@
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 6 request_build_done bytes=%zu\n",
++        strlen(post_data));
++
+     syslog(LOG_INFO,
+         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
+         TAG, model, (int)strlen(post_data));
+@@ -793,6 +814,7 @@
+         rb.len = 0;
+         status = 0;
+         s_diag_last_stage = "send";
++        syslog(LOG_INFO, "[LLM-GATE] 7 transport_enter\n");
+         err = llm_http_call(post_data, &rb, &status);
+         s_diag_last_status = status;
+         syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
+--- a/src/llm/llm_router.c
++++ b/src/llm/llm_router.c
+@@ -518,8 +518,27 @@
+         return -1;
+     }
+ 
++    size_t host_len = strnlen(b.host, sizeof(b.host));
++    size_t path_len = strnlen(b.path, sizeof(b.path));
++    size_t model_len = strnlen(b.model, sizeof(b.model));
++    size_t key_len = strnlen(b.api_key, sizeof(b.api_key));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config source host_ptr=%p host_len=%zu "
++        "path_ptr=%p path_len=%zu model_ptr=%p model_len=%zu "
++        "key_ptr=%p key_len=%zu\n",
++        (void*)b.host, host_len, (void*)b.path, path_len,
++        (void*)b.model, model_len, (void*)b.api_key, key_len);
++    if (host_len >= sizeof(b.host) || path_len >= sizeof(b.path)
++        || model_len >= sizeof(b.model) || key_len >= sizeof(b.api_key)) {
++        syslog(LOG_ERR, "[LLM-GATE] backend config unterminated\n");
++        return -1;
++    }
++
+     /* Atomic update — single lock acquisition in llm_proxy */
+-    llm_set_all(b.host, b.path, b.port, b.api_key, b.model);
++    if (llm_set_all(b.host, b.path, b.port, b.api_key, b.model) != OK) {
++        return -1;
++    }
++    syslog(LOG_INFO, "[LLM-GATE] 3 config_snapshot_ok\n");
+ 
+     return 0;
+ }

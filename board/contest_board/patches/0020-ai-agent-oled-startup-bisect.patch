@@ -1,0 +1,13 @@
+diff --git a/src/agent_main.c b/src/agent_main.c
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -623,9 +623,6 @@
+     }
+     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
+ 
+-    if (agent_oled_start() != OK)
+-        BOOT_LOG(&t0, "P5", "OLED worker unavailable");
+-
+ #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+     /* Quickapp mqueue listener - receives requests from quickapp process */
+     if (agent_task_create(quickapp_mq_listener_task, "qapp_mq",

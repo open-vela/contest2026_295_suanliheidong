@@ -1,0 +1,6 @@
+config LVX_USE_DEMO_CONTEST2026_295_ROBOT_VOICE
+	bool "Contest robot voice"
+	default n
+	depends on I2S && AUDIO && NETUTILS_CJSON
+	---help---
+		Build the independent MiMo robot_voice one-shot voice application.

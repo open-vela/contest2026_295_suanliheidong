@@ -1,0 +1,11 @@
+diff --git a/packages/ai_agent/src/tools/tool_media.c b/packages/ai_agent/src/tools/tool_media.c
+--- a/packages/ai_agent/src/tools/tool_media.c
++++ b/packages/ai_agent/src/tools/tool_media.c
+@@ -1141,7 +1141,7 @@ static void url_encode(const char* src, char* dst, size_t dstsz)
+  ****************************************************************************/
+ 
+-#define SEARCH_RESP_SIZE 8192
++#define SEARCH_RESP_SIZE 16384
+ #define SEARCH_MAX_RESULTS 5
+ 
+ static void url_encode(const char* src, char* dst, size_t dstsz)

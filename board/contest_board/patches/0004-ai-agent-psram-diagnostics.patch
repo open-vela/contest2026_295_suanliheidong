@@ -1,0 +1,266 @@
+--- a/src/agent_main.c	2026-08-19 21:13:02.542704912 +0800
++++ b/src/agent_main.c	2026-08-19 22:33:23.078583357 +0800
+@@ -542,6 +542,8 @@
+     struct timespec t0;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+ 
++    agent_loop_heap_diag("AI_AGENT_START");
++
+     syslog(LOG_INFO, "[%s] AI Agent - Vela AI Agent starting (build: %s)\n",
+         TAG, AGENT_BUILD_VERSION);
+ 
+--- a/src/core/agent_loop.c	2026-08-19 21:13:02.542704912 +0800
++++ b/src/core/agent_loop.c	2026-08-19 22:33:23.081583399 +0800
+@@ -37,6 +37,9 @@
+ #include "agent_compat.h"
+ #include "agent_config.h"
+ 
++#include <nuttx/mm/mm.h>
++#include "../../../../nuttx/mm/mm_heap/mm.h"
++
+ #include <pthread.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+@@ -54,6 +57,14 @@
+ 
+ #define AGENT_LOOP_BISECT_A2E 1
+ 
++#ifndef AGENT_LOOP_BISECT_PSRAM
++#  define AGENT_LOOP_BISECT_PSRAM 1
++#endif
++
++/* Mirrors esp32s3_ptr_extram(): SOC_EXTRAM_DATA_[LOW,HIGH] in ESP-IDF. */
++#define AGENT_LOOP_PSRAM_LOW  0x3c000000u
++#define AGENT_LOOP_PSRAM_HIGH 0x3e000000u
++
+ #if AGENT_LOOP_BISECT_A2E
+ static pthread_mutex_t s_agent_bisect_lock = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t s_agent_bisect_cond = PTHREAD_COND_INITIALIZER;
+@@ -65,6 +76,114 @@
+ static size_t s_dummy_tools_size;
+ static bool s_dummy_tools_held;
+ 
++struct agent_heap_diag_s
++{
++    size_t internal_free;
++    size_t internal_largest;
++    size_t psram_free;
++    size_t psram_largest;
++};
++
++static const char *agent_loop_mem_kind(const void *ptr)
++{
++    uintptr_t addr = (uintptr_t)ptr;
++
++    return addr >= AGENT_LOOP_PSRAM_LOW && addr < AGENT_LOOP_PSRAM_HIGH ?
++        "PSRAM" : "INTERNAL";
++}
++
++static void agent_loop_heap_diag_node(struct mm_allocnode_s *node,
++    void *arg)
++{
++    struct agent_heap_diag_s *stats = arg;
++    size_t size;
++    size_t *free_bytes;
++    size_t *largest;
++
++    if (!MM_NODE_IS_FREE(node)) {
++        return;
++    }
++
++    size = MM_SIZEOF_NODE(node);
++    if (agent_loop_mem_kind(node)[0] == 'P') {
++        free_bytes = &stats->psram_free;
++        largest = &stats->psram_largest;
++    } else {
++        free_bytes = &stats->internal_free;
++        largest = &stats->internal_largest;
++    }
++
++    *free_bytes += size;
++    if (size > *largest) {
++        *largest = size;
++    }
++}
++
++void agent_loop_heap_diag(const char *phase)
++{
++    struct agent_heap_diag_s stats = { 0 };
++    struct mallinfo combined = mallinfo();
++
++    if (g_mmheap != NULL) {
++        mm_foreach(g_mmheap, agent_loop_heap_diag_node, &stats);
++    }
++
++    syslog(LOG_INFO,
++        "[MEM-DIAG] phase=%s internal free=%zu largest=%zu psram free=%zu largest=%zu combined free=%u largest=%u\n",
++        phase, stats.internal_free, stats.internal_largest,
++        stats.psram_free, stats.psram_largest,
++        combined.fordblks, combined.mxordblk);
++}
++
++static void *agent_loop_alloc_psram(size_t size)
++{
++    void *discarded[64];
++    int count = 0;
++    void *ptr;
++
++    while (count < (int)(sizeof(discarded) / sizeof(discarded[0]))) {
++        ptr = calloc(1, size);
++        if (!ptr || agent_loop_mem_kind(ptr)[0] == 'P') {
++            while (count > 0) {
++                free(discarded[--count]);
++            }
++            return ptr;
++        }
++
++        discarded[count++] = ptr;
++    }
++
++    while (count > 0) {
++        free(discarded[--count]);
++    }
++
++    return NULL;
++}
++
++static int agent_loop_pool_init_psram(agent_mem_pool_t *pool,
++    size_t buf_size, int count)
++{
++    if (count > AGENT_POOL_SLOTS) {
++        count = AGENT_POOL_SLOTS;
++    }
++
++    memset(pool, 0, sizeof(*pool));
++    pool->buf_size = buf_size;
++    pool->count = count;
++    pthread_mutex_init(&pool->lock, NULL);
++    for (int i = 0; i < count; i++) {
++        pool->buffers[i] = agent_loop_alloc_psram(buf_size);
++        if (!pool->buffers[i]) {
++            for (int j = 0; j < i; j++) {
++                free(pool->buffers[j]);
++            }
++            pthread_mutex_destroy(&pool->lock);
++            return ERROR;
++        }
++    }
++    return OK;
++}
++
+ static void agent_loop_bisect_fill_canary(char* ptr)
+ {
+     memset(ptr, 0xd3, AGENT_LOOP_DUMMY_REDZONE_BYTES);
+@@ -1503,6 +1622,8 @@
+ 
+     agent_mem_status_t mem_st;
+ 
++    agent_loop_heap_diag("STARTUP");
++
+     agent_mem_get_status(&mem_st);
+ #if !AGENT_LOOP_BISECT_A2E
+     syslog(LOG_INFO, "[%s] Agent loop started, free heap: %zu\n",
+@@ -1516,9 +1637,18 @@
+     size_t tool_size = agent_mem_safe_size(
+         TOOL_OUTPUT_SIZE, TOOL_OUTPUT_SIZE_MIN);
+ 
+-    char* sys_prompt = calloc(1, ctx_size);
+-    char* history_json = calloc(1, hist_size);
+-    char* tool_output = calloc(1, tool_size);
++    char* sys_prompt;
++    char* history_json;
++    char* tool_output;
++#if AGENT_LOOP_BISECT_PSRAM
++    sys_prompt = agent_loop_alloc_psram(ctx_size);
++    history_json = agent_loop_alloc_psram(hist_size);
++    tool_output = agent_loop_alloc_psram(tool_size);
++#else
++    sys_prompt = calloc(1, ctx_size);
++    history_json = calloc(1, hist_size);
++    tool_output = calloc(1, tool_size);
++#endif
+     char* tools_json = NULL;
+ 
+     if (!sys_prompt || !history_json || !tool_output) {
+@@ -1535,26 +1665,35 @@
+ #endif
+ 
+     /* A2e: buffers, pool, then an optional CLI-controlled dummy allocation. */
+-    syslog(LOG_INFO, "[HEAP-DIAG] name=ctx ptr=%p size=%zu\n",
+-        (void*)sys_prompt, ctx_size);
+-    syslog(LOG_INFO, "[HEAP-DIAG] name=hist ptr=%p size=%zu\n",
+-        (void*)history_json, hist_size);
+-    syslog(LOG_INFO, "[HEAP-DIAG] name=tool ptr=%p size=%zu\n",
+-        (void*)tool_output, tool_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=ctx ptr=%p region=%s size=%zu\n",
++        (void*)sys_prompt, agent_loop_mem_kind(sys_prompt), ctx_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=hist ptr=%p region=%s size=%zu\n",
++        (void*)history_json, agent_loop_mem_kind(history_json), hist_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=tool ptr=%p region=%s size=%zu\n",
++        (void*)tool_output, agent_loop_mem_kind(tool_output), tool_size);
++    agent_loop_heap_diag("BUFFERS");
+     size_t pool_buf_size = agent_mem_safe_size(
+         TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
++#if AGENT_LOOP_BISECT_PSRAM
++    if (agent_loop_pool_init_psram(&s_tool_pool, pool_buf_size,
++            AGENT_MAX_TOOL_CALLS)
++#else
+     if (agent_pool_init(&s_tool_pool, pool_buf_size,
+             AGENT_MAX_TOOL_CALLS)
++#endif
+         == OK) {
+         s_pool_ready = true;
+     } else {
+         syslog(LOG_WARNING,
+             "[%s] Pool init failed, using heap fallback\n", TAG);
+     }
+-    syslog(LOG_INFO, "[HEAP-DIAG] name=pool0 ptr=%p size=%zu\n",
+-        (void*)s_tool_pool.buffers[0], pool_buf_size);
+-    syslog(LOG_INFO, "[HEAP-DIAG] name=pool1 ptr=%p size=%zu\n",
+-        (void*)s_tool_pool.buffers[1], pool_buf_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=pool0 ptr=%p region=%s size=%zu\n",
++        (void*)s_tool_pool.buffers[0],
++        agent_loop_mem_kind(s_tool_pool.buffers[0]), pool_buf_size);
++    syslog(LOG_INFO, "[HEAP-DIAG] name=pool1 ptr=%p region=%s size=%zu\n",
++        (void*)s_tool_pool.buffers[1],
++        agent_loop_mem_kind(s_tool_pool.buffers[1]), pool_buf_size);
++    agent_loop_heap_diag("TOOL_POOL");
+ 
+     pthread_mutex_lock(&s_agent_bisect_lock);
+     for (;;) {
+--- a/src/core/agent_loop.h	2026-08-19 21:13:02.542704912 +0800
++++ b/src/core/agent_loop.h	2026-08-19 22:33:23.078583357 +0800
+@@ -30,6 +30,7 @@
+ 
+ int agent_loop_init(void);
+ int agent_loop_start(void);
++void agent_loop_heap_diag(const char *phase);
+ void agent_loop_bisect_http_canary_check(const char *phase);
+ int agent_loop_bisect_heap_hold(size_t size);
+ 
+--- a/src/infra/vela_tls.c	2026-08-19 21:13:02.542704912 +0800
++++ b/src/infra/vela_tls.c	2026-08-19 22:33:23.078583357 +0800
+@@ -16,6 +16,7 @@
+ 
+ #include "infra/vela_tls.h"
+ #include "infra/http_proxy.h"
++#include "core/agent_loop.h"
+ #include "agent_compat.h"
+ #include "agent_config.h"
+ 
+@@ -53,6 +54,7 @@
+ uint32_t vela_http_diag_begin(void)
+ {
+     struct mallinfo mi = mallinfo();
++    agent_loop_heap_diag("HTTP_PRE");
+     s_http_diag_active = ++s_http_diag_seq;
+     syslog(LOG_INFO,
+         "[RESOURCE-DIAG] seq=%" PRIu32 " phase=PRE heap_free=%d arena=%d\n",
+@@ -63,6 +65,7 @@
+ void vela_http_diag_end(uint32_t seq)
+ {
+     struct mallinfo mi = mallinfo();
++    agent_loop_heap_diag("HTTP_POST");
+     syslog(LOG_INFO,
+         "[RESOURCE-DIAG] seq=%" PRIu32 " phase=POST heap_free=%d arena=%d\n",
+         seq, mi.fordblks, mi.arena);

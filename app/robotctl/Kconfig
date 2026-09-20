@@ -1,0 +1,12 @@
+#
+# Contest 2026 EDA Robot control application
+#
+
+config LVX_USE_DEMO_CONTEST2026_295_ROBOTCTL
+	bool "EDA Robot control"
+	default n
+	depends on PWM && PWM_MULTICHAN
+	---help---
+		Build the robotctl NSH builtin for the contest ESP32-S3 board.
+		The application uses /dev/pwm0 only when a motion command is run.
+

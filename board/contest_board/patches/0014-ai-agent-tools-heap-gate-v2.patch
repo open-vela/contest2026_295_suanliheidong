@@ -1,0 +1,407 @@
+--- a/src/llm/llm_parse.c
++++ b/src/llm/llm_parse.c
+@@ -37,12 +37,393 @@
+ #include "agent_config.h"
+ 
+ #include "cJSON.h"
++#include <nuttx/arch.h>
++#include <nuttx/mm/mm.h>
++#include "../../../../nuttx/mm/mm_heap/mm.h"
++#include <nuttx/mutex.h>
++#include <sched.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <syslog.h>
+ 
+ static const char* TAG = "llm_parse";
+ 
++enum agent_heap_gate_reason_e
++{
++    AGENT_HEAP_GATE_NONE = 0,
++    AGENT_HEAP_GATE_CONTEXT,
++    AGENT_HEAP_GATE_LOCK,
++    AGENT_HEAP_GATE_REGION,
++    AGENT_HEAP_GATE_NODE_ADDR,
++    AGENT_HEAP_GATE_NODE_ALIGN,
++    AGENT_HEAP_GATE_NODE_SIZE,
++    AGENT_HEAP_GATE_NODE_BOUNDS,
++    AGENT_HEAP_GATE_PREVFREE_FLAG,
++    AGENT_HEAP_GATE_PRECEDING_SIZE,
++    AGENT_HEAP_GATE_FREE_MIN_SIZE,
++    AGENT_HEAP_GATE_GUARD,
++    AGENT_HEAP_GATE_LINK,
++};
++
++struct agent_heap_gate_result_s
++{
++    enum agent_heap_gate_reason_e reason;
++    int region;
++    uintptr_t node;
++    uintptr_t flink;
++    uintptr_t blink;
++    size_t size;
++};
++
++static const char *agent_heap_gate_reason_name(
++    enum agent_heap_gate_reason_e reason)
++{
++    switch (reason) {
++    case AGENT_HEAP_GATE_NONE:
++        return "NONE";
++    case AGENT_HEAP_GATE_CONTEXT:
++        return "CONTEXT";
++    case AGENT_HEAP_GATE_LOCK:
++        return "LOCK";
++    case AGENT_HEAP_GATE_REGION:
++        return "REGION";
++    case AGENT_HEAP_GATE_NODE_ADDR:
++        return "NODE_ADDR";
++    case AGENT_HEAP_GATE_NODE_ALIGN:
++        return "NODE_ALIGN";
++    case AGENT_HEAP_GATE_NODE_SIZE:
++        return "NODE_SIZE";
++    case AGENT_HEAP_GATE_NODE_BOUNDS:
++        return "NODE_BOUNDS";
++    case AGENT_HEAP_GATE_PREVFREE_FLAG:
++        return "PREVFREE_FLAG";
++    case AGENT_HEAP_GATE_PRECEDING_SIZE:
++        return "PRECEDING_SIZE";
++    case AGENT_HEAP_GATE_FREE_MIN_SIZE:
++        return "FREE_MIN_SIZE";
++    case AGENT_HEAP_GATE_GUARD:
++        return "GUARD";
++    case AGENT_HEAP_GATE_LINK:
++        return "LINK";
++    default:
++        return "UNKNOWN";
++    }
++}
++
++static void agent_heap_gate_fail(struct agent_heap_gate_result_s *result,
++    enum agent_heap_gate_reason_e reason, int region,
++    const struct mm_freenode_s *node, size_t size)
++{
++    result->reason = reason;
++    result->region = region;
++    result->node = (uintptr_t)node;
++    result->size = size;
++}
++
++static void agent_heap_gate_capture_links(
++    struct agent_heap_gate_result_s *result,
++    const struct mm_freenode_s *node)
++{
++    result->flink = (uintptr_t)node->flink;
++    result->blink = (uintptr_t)node->blink;
++}
++
++static bool agent_heap_gate_is_sentinel(const struct mm_heap_s *heap,
++    const struct mm_freenode_s *ptr)
++{
++    for (int i = 0; i < MM_NNODES; i++) {
++        if (ptr == &heap->mm_nodelist[i]) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static bool agent_heap_gate_is_region_node(const struct mm_heap_s *heap,
++    const struct mm_freenode_s *ptr)
++{
++    uintptr_t address = (uintptr_t)ptr;
++
++    if (ptr == NULL || (address & (MM_ALIGN - 1)) != 0) {
++        return false;
++    }
++
++#if CONFIG_MM_REGIONS > 1
++    int regions = heap->mm_nregions;
++#else
++    int regions = 1;
++#endif
++
++    if (regions <= 0 || regions > CONFIG_MM_REGIONS) {
++        return false;
++    }
++
++    for (int i = 0; i < regions; i++) {
++        uintptr_t start = (uintptr_t)heap->mm_heapstart[i];
++        uintptr_t end = (uintptr_t)heap->mm_heapend[i];
++
++        if (end > start && address >= start && address < end &&
++            sizeof(struct mm_freenode_s) <= end - address) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static bool agent_heap_gate_is_safe_link(const struct mm_heap_s *heap,
++    const struct mm_freenode_s *ptr)
++{
++    return ptr == NULL || agent_heap_gate_is_sentinel(heap, ptr) ||
++        agent_heap_gate_is_region_node(heap, ptr);
++}
++
++/* This checker runs in task context while holding the allocator lock. It
++ * performs no allocation and never emits diagnostics while the lock is held.
++ */
++static bool agent_heap_gate_check(struct agent_heap_gate_result_s *result)
++{
++    struct mm_heap_s *heap = USR_HEAP;
++    int regions;
++
++    memset(result, 0, sizeof(*result));
++    result->reason = AGENT_HEAP_GATE_NONE;
++
++    if (heap == NULL || up_interrupt_context() || sched_idletask()) {
++        result->reason = AGENT_HEAP_GATE_CONTEXT;
++        return false;
++    }
++
++#if CONFIG_MM_REGIONS > 1
++    regions = heap->mm_nregions;
++#else
++    regions = 1;
++#endif
++
++    if (regions <= 0 || regions > CONFIG_MM_REGIONS) {
++        result->reason = AGENT_HEAP_GATE_REGION;
++        return false;
++    }
++
++    if (nxrmutex_lock(&heap->mm_lock) < 0) {
++        result->reason = AGENT_HEAP_GATE_LOCK;
++        return false;
++    }
++
++    for (int region = 0; region < regions; region++) {
++        uintptr_t start = (uintptr_t)heap->mm_heapstart[region];
++        uintptr_t end = (uintptr_t)heap->mm_heapend[region];
++        struct mm_allocnode_s *node;
++        struct mm_allocnode_s *prev_node = NULL;
++        size_t prev_size = 0;
++        bool prev_is_free = false;
++        size_t steps = 0;
++        size_t max_steps;
++
++        if (start == 0 || end <= start ||
++            end - start < 2 * MM_SIZEOF_ALLOCNODE) {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_REGION, region,
++                NULL, 0);
++            goto done;
++        }
++
++        max_steps = (size_t)((end - start) / MM_SIZEOF_ALLOCNODE) + 1;
++        node = heap->mm_heapstart[region];
++        while ((uintptr_t)node < end) {
++            uintptr_t address = (uintptr_t)node;
++            size_t remaining = end - address;
++            size_t size;
++            bool flag_prev_free;
++
++            if (steps++ >= max_steps) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, (struct mm_freenode_s *)node, 0);
++                goto done;
++            }
++
++            if (remaining < MM_SIZEOF_ALLOCNODE) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, (struct mm_freenode_s *)node, 0);
++                goto done;
++            }
++
++            if ((address & (MM_ALIGN - 1)) != 0) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_ALIGN,
++                    region, (struct mm_freenode_s *)node, 0);
++                goto done;
++            }
++
++            size = MM_SIZEOF_NODE(node);
++            if (size < MM_SIZEOF_ALLOCNODE) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_SIZE,
++                    region, (struct mm_freenode_s *)node, size);
++                goto done;
++            }
++
++            if ((size & (MM_ALIGN - 1)) != 0) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_ALIGN,
++                    region, (struct mm_freenode_s *)node, size);
++                goto done;
++            }
++
++            if (size > remaining) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, (struct mm_freenode_s *)node, size);
++                goto done;
++            }
++
++            flag_prev_free = MM_PREVNODE_IS_FREE(node);
++            if (prev_node != NULL && flag_prev_free != prev_is_free) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PREVFREE_FLAG,
++                    region, (struct mm_freenode_s *)node, size);
++                goto done;
++            }
++
++            if (prev_node != NULL && flag_prev_free &&
++                node->preceding != prev_size) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PRECEDING_SIZE,
++                    region, (struct mm_freenode_s *)node, size);
++                goto done;
++            }
++
++            if (MM_NODE_IS_FREE(node)) {
++                struct mm_freenode_s *free_node =
++                    (struct mm_freenode_s *)node;
++
++                if (size < MM_MIN_CHUNK) {
++                    agent_heap_gate_fail(result,
++                        AGENT_HEAP_GATE_FREE_MIN_SIZE, region,
++                        free_node, size);
++                    goto done;
++                }
++
++                if (!agent_heap_gate_is_safe_link(heap, free_node->blink) ||
++                    !agent_heap_gate_is_safe_link(heap, free_node->flink)) {
++                    agent_heap_gate_capture_links(result, free_node);
++                    agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, region,
++                        free_node, size);
++                    goto done;
++                }
++
++                if (free_node->blink != NULL &&
++                    ((agent_heap_gate_is_sentinel(heap, free_node->blink) &&
++                      free_node->blink->flink != free_node) ||
++                     (!agent_heap_gate_is_sentinel(heap, free_node->blink) &&
++                      ((struct mm_freenode_s *)free_node->blink)->flink !=
++                          free_node))) {
++                    agent_heap_gate_capture_links(result, free_node);
++                    agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, region,
++                        free_node, size);
++                    goto done;
++                }
++
++                if (free_node->flink != NULL &&
++                    ((agent_heap_gate_is_sentinel(heap, free_node->flink) &&
++                      free_node->flink->blink != free_node) ||
++                     (!agent_heap_gate_is_sentinel(heap, free_node->flink) &&
++                      ((struct mm_freenode_s *)free_node->flink)->blink !=
++                          free_node))) {
++                    agent_heap_gate_capture_links(result, free_node);
++                    agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, region,
++                        free_node, size);
++                    goto done;
++                }
++            }
++
++            if (size > UINTPTR_MAX - address) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, (struct mm_freenode_s *)node, size);
++                goto done;
++            }
++
++            prev_node = node;
++            prev_size = size;
++            prev_is_free = MM_NODE_IS_FREE(node);
++            node = (struct mm_allocnode_s *)(address + size);
++        }
++
++        if ((uintptr_t)node != end) {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                region, (struct mm_freenode_s *)node, 0);
++            goto done;
++        }
++
++        {
++            size_t guard_size = MM_SIZEOF_NODE(node);
++            bool guard_prev_free = MM_PREVNODE_IS_FREE(node);
++
++            if (guard_size != MM_SIZEOF_ALLOCNODE ||
++                !MM_NODE_IS_ALLOC(node)) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_GUARD, region,
++                    (struct mm_freenode_s *)node, guard_size);
++                goto done;
++            }
++
++            if (prev_node == NULL || guard_prev_free != prev_is_free) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PREVFREE_FLAG,
++                    region, (struct mm_freenode_s *)node, guard_size);
++                goto done;
++            }
++
++            if (guard_prev_free && node->preceding != prev_size) {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PRECEDING_SIZE,
++                    region, (struct mm_freenode_s *)node, guard_size);
++                goto done;
++            }
++        }
++    }
++
++    for (int i = 0; i < MM_NNODES; i++) {
++        struct mm_freenode_s *sentinel = &heap->mm_nodelist[i];
++
++        if (!agent_heap_gate_is_safe_link(heap, sentinel->flink) ||
++            !agent_heap_gate_is_safe_link(heap, sentinel->blink)) {
++            agent_heap_gate_capture_links(result, sentinel);
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, -1,
++                sentinel, 0);
++            goto done;
++        }
++
++        if (sentinel->flink != NULL && sentinel->flink->blink != sentinel) {
++            agent_heap_gate_capture_links(result, sentinel);
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, -1,
++                sentinel, 0);
++            goto done;
++        }
++
++        if (sentinel->blink != NULL && sentinel->blink->flink != sentinel) {
++            agent_heap_gate_capture_links(result, sentinel);
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, -1,
++                sentinel, 0);
++            goto done;
++        }
++    }
++
++done:
++    nxrmutex_unlock(&heap->mm_lock);
++    return result->reason == AGENT_HEAP_GATE_NONE;
++}
++
++static bool agent_heap_gate_tools_parsed(void)
++{
++    struct agent_heap_gate_result_s result;
++    bool pass = agent_heap_gate_check(&result);
++
++    if (pass) {
++        syslog(LOG_INFO, "[HEAP-GATE] TOOLS_PARSED PASS\n");
++    } else {
++        syslog(LOG_ERR,
++            "[HEAP-GATE] TOOLS_PARSED FAIL reason=%s(%d) region=%d "
++            "node=%p flink=%p blink=%p size=%zu\n",
++            agent_heap_gate_reason_name(result.reason), result.reason,
++            result.region, (void *)result.node,
++            (void *)result.flink, (void *)result.blink, result.size);
++    }
++
++    return pass;
++}
++
+ /* ── Tools format conversion ──────────────────────────────── */
+ 
+ cJSON* build_openai_tools_array(const char* tools_json)
+@@ -58,6 +439,10 @@
+         return NULL;
+     }
+ 
++    if (!agent_heap_gate_tools_parsed()) {
++        return NULL;
++    }
++
+     cJSON* tools_arr = cJSON_CreateArray();
+     cJSON* tool_def;
+ 

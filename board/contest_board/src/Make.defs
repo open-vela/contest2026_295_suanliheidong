@@ -1,0 +1,61 @@
+############################################################################
+# board/contest_board/src/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+############################################################################
+
+include $(TOPDIR)/Make.defs
+
+CSRCS = board_boot.c board_bringup.c
+
+ifeq ($(CONFIG_ESP32S3_I2S),y)
+CSRCS += board_voice_i2s.c
+endif
+
+ifeq ($(CONFIG_CONTEST_BOARD_I2S1_TX),y)
+ifeq ($(CONFIG_DRIVERS_AUDIO),y)
+ifeq ($(CONFIG_AUDIO_I2S),y)
+CSRCS += board_voice_audio.c
+endif
+endif
+endif
+
+ifneq ($(filter y,$(CONFIG_CONTEST_BOARD_I2S0_RX) $(CONFIG_CONTEST_BOARD_I2S1_TX)),)
+CSRCS += contest_i2s.c
+endif
+
+ifeq ($(CONFIG_LCD_SSD1306_I2C),y)
+CSRCS += board_oled.c
+endif
+
+ifeq ($(CONFIG_ARCH_BUTTONS),y)
+CSRCS += board_buttons.c
+endif
+
+ifeq ($(CONFIG_BOARDCTL),y)
+CSRCS += board_appinit.c
+endif
+
+DEPPATH += --dep-path board
+VPATH += :board
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)board$(DELIM)board
+
+# contest_i2s.c uses the existing ESP32-S3 register headers.  Board objects
+# are not built with the architecture HAL include set, so add only the header
+# roots required by those read-only register definitions.
+
+ifneq ($(filter y,$(CONFIG_CONTEST_BOARD_I2S0_RX) $(CONFIG_CONTEST_BOARD_I2S1_TX)),)
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)nuttx$(DELIM)esp32s3$(DELIM)include
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)components$(DELIM)soc$(DELIM)esp32s3$(DELIM)include
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)components$(DELIM)soc$(DELIM)include
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)chip$(DELIM)esp-hal-3rdparty$(DELIM)components$(DELIM)esp_common$(DELIM)include
+endif
+
+ifeq ($(CONFIG_ETC_ROMFS),y)
+RCSRCS += etc/init.d/rc.sysinit etc/init.d/rcS
+endif
+
+ifeq ($(CONFIG_MEDIA_SERVER),y)
+RCSRCS += etc/media/graph.conf
+RCRAWS += etc/media/criteria.txt etc/media/settings.pfw etc/media/test.wav
+endif

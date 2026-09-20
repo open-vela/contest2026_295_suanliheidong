@@ -1,0 +1,9 @@
+/****************************************************************************
+ * board/contest_board/src/etc/init.d/rc.sysinit
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
+
+#include <nuttx/config.h>
+
+set +e

@@ -1,148 +1,274 @@
-# contest2026_295_suanliheidong
-
-👋 欢迎参加 **2026 首届 openvela AI 硬件开发者大赛**！
-
-这是组委会为你的队伍创建的**专属参赛仓库**（本仓为样例/模板，队伍编号 `295`；你看到的将是你自己的 `contest2026_<编号>_<队伍名>`）。比赛期间，你的全部参赛代码、打包产物与 AI Coding 日志都提交到这里。
-
-> 本仓既是「代码仓」，又内置了一键拉取整套 openvela 工程的 `repo` 清单（manifest）。你只需跟它打交道，**自始至终只动一个文件夹**。
-
----
-
-## 一、先读这些官方文档
-
-**通用（所有赛道必读）：**
-
-| 文档                                                                                                                                     | 用途                                           |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| [《大赛总览》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/contest_overview.md)                        | 赛道、流程、评分、资源，建议先通读             |
-| [《参赛代码提交指南》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/code_submission_guide.md)           | 仓库获取、提交流程、时间与权限（**以此为准**） |
-| [《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md) | 如何导出 AI 对话日志并提交到 `logs/`           |
-
-**按你的赛道选读（三选一）：**
-
-| 赛道                  | 教程导航                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快应用 / 手表应用创新 | [快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)                         |
-| AI 硬件产品创新       | [AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)              |
-| 新硬件适配            | [新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md) |
-
----
-
-## 二、第一步：拉取完整工程
-
-用组委会提供的命令一键拉取「openvela 全量源码 + 你的专属仓」：
-
-```bash
-repo init -u https://github.com/open-vela/contest2026_295_suanliheidong \
-  -b dev-ai-contest-2026 -m contest2026_295_suanliheidong.xml
-repo sync -c -j8
-```
-
-同步后，你的整个仓库位于工作区的 `contest2026_295_suanliheidong/`，openvela 全量源码在外层（`nuttx/`、`apps/`、`packages/`、`vendor/` 等）。
-
----
-
-## 三、第二步：在哪里写代码
-
-**只在自己的仓目录 `contest2026_295_suanliheidong/` 里开发。** 不同作品形态放在对应子目录，manifest 会通过 `<linkfile>` 把它们**软链**到 openvela 编译树该在的位置——你不用手动 copy：
-
-| 作品形态 | 你的代码放这里             | 系统自动映射到                                 |
-| -------- | -------------------------- | ---------------------------------------------- |
-| 应用     | `app/hello_app/`           | `packages/demos/contest2026_295_hello_app`     |
-| 快应用   | `quickapp/hello_quickapp/` | `packages/apps/contest2026_295_hello_quickapp` |
-| 板级适配 | `board/contest_board/`     | `vendor/openvela/boards/contest2026_295_board` |
-
-> 用不到的形态目录可以删掉；新增作品时按同样规则加子目录，并在 `contest2026_295_suanliheidong.xml` 里补一条 `<linkfile>` 映射即可。**生产仓库（packages/nuttx/vendor 等）零改动。**
-
-建议仓库目录约定（便于评委定位）：
-
-```text
-app/ | quickapp/ | board/   # 你的作品代码
-logs/                       # AI Coding 日志（主动导出后提交，格式见 logs/README.md）
-README.md                   # 作品说明（提交前请改成你自己的，见第六节）
-```
-
-> 仓内附带了一个 `.gitignore.example`，给出了**编译产物**等不需要进仓的文件示例。如需启用，`cp .gitignore.example .gitignore` 后按需增删即可。**注意 `logs/` 下最终导出的 AI Coding 日志必须提交，不要忽略。**
->
-> `logs/` 的目录结构与提交格式见 [logs/README.md](logs/README.md)。
-
----
-
-## 四、第三步：编译与运行
-
-编译/运行步骤随作品形态不同而不同，请参考你所在赛道的教程导航：
-
-- 快应用 / 手表应用：[快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)（含模拟器与开发板部署）。
-- AI 硬件产品创新：[AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)（环境搭建、编译烧录、Skill 开发）。
-- 新硬件适配：[新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md)（BSP 移植、最小 NSH 基线）。
-
-子目录已通过 manifest 中的 `<linkfile>` 软链进 openvela 编译树，因此构建在 openvela 工作区**根目录**（即你这个仓的上一级）进行。openvela 使用 `build.sh` 作为统一入口，接收一个 **board config 路径**作为参数：
-
-```bash
-# 进入 openvela 工作区根目录（你的仓的上一级）
-cd ..
-
-# 通用语法：第一个参数是 board config 路径，第二个参数可以是 menuconfig / distclean 等
-./build.sh <board-config-path> [menuconfig|distclean] [-j8]
-```
-
-> 具体的 board config 路径、目标产物、模拟器/真机部署方式请以你所在赛道的教程导航为准。本仓 `app/` `quickapp/` `board/` 三个示例骨架对应的 Kconfig 选项可通过 `menuconfig` 启用。
-
----
-
-## 五、第四步：提交作品
-
-1. **fork** 你的专属仓 → 开发 → `git commit` 并推送 → 向专属仓发起 **Pull Request**，可**自行 review 并合入**（无需等组委会）。
-2. **AI Coding 日志**：与 AI 工具的对话会自动记录到本机 staging（不会自动上传），需你**主动导出/打包**选定会话到仓内 `logs/` 目录后一并提交。详见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
-3. 若需改动 **nuttx 等公共仓库**，不在本仓改，而是 fork 对应公共仓、以 PR 提交到 `dev-ai-contest-2026` 分支，由组委会 review 后合入。
-
-> ⏰ **提交作品截止：9 月 20 日**。截止后统一收回 push 权限，仍可查看 / clone。
->
-> 获奖后再按要求将作品 PR 至 openvela 上游对应仓库（走标准 PR + CI 流程）。
-
-### 关于 PR 与 CLA
-
-- 本仓所有改动通过 **Pull Request** 合入（分支保护强制，可自行合入自己的 PR）。
-- 首次贡献需在[**官网签署 CLA**](https://openvela.com/#/community/cla)；PR 上会自动跑 `cla/signature` 检查，在官网签署成功后，在 PR 评论 `/check-cla` 复检即可通过。
-
----
-
-## 六、提交前：把本 README 改成你的作品说明
-
-本文件目前是组委会给的**使用说明书**。**作品提交前，请把它替换成你自己作品的说明**，方便评委快速了解你做了什么、怎么跑起来。建议至少包含以下内容：
-
-```markdown
-# <你的作品名>
+# 基于 openvela 的 AI 智能机器狗
 
 ## 一、作品简介
-<一句话/一段话说明这个作品是什么、解决什么问题、亮点在哪>
+
+VoicePet 是一款基于 openvela、ESP32-S3 和 MiMo V2.5 的具身智能机器狗。它把语音理解、大模型 Agent、机器人动作、OLED 表情、音乐播放和语音播报连接成完整闭环，让机器狗不仅能回答问题，还能根据对话调用真实硬件能力。
+
+作品的主要亮点：
+
+- 使用 openvela 官方 `ai_agent`，统一处理文本和语音交互；
+- 集成 MiMo V2.5 ASR、LLM 和 TTS；
+- `voice_start` 开启后持续进行语音输入，将采集到的人声送入 ASR 和 Agent；
+- 人声输入时停止音乐播放，避免语音交互和音乐同时输出；
+- 解决 Media 音频播放在 WLAN 发送完成日志出现时的卡顿问题，未修改官方 WLAN 源文件；
+- 支持前进、后退、左转、右转、安全摇尾巴和 OLED 表情；
+- 支持本地 WAV、openvela Media 播放，以及饮食推荐、机器人陪伴等 Markdown Skill。
 
 ## 二、选题方向
-<快应用 / 手表应用创新 ｜ AI 硬件产品创新 ｜ 新硬件适配 ｜ 自定方向，并简述理由>
 
-## 三、目录结构
-<列出你这个仓里各目录/文件的作用，例如：>
-- `app/xxx/`        — <说明>
-- `board/xxx/`      — <说明>
-- `quickapp/xxx/`   — <说明>
-- `logs/`           — AI Coding 日志
-- `docs/` 或其他    — <说明>
+**AI 硬件产品创新**。
 
-## 四、运行方式
-<拉取工程后，如何编译、烧录/部署、运行的完整步骤；最好能让评委照着一步步复现>
+本作品将大模型从纯软件对话扩展到真实机器人：Agent 负责理解意图和选择能力，Tool 负责执行动作，硬件负责运动、显示、采集和播报。作品重点解决了嵌入式 AI 产品中的语音交互闭环、硬件安全、音频连续播放和多模块协同问题。
 
-## 五、AI Coding 使用说明
-<说明本作品如何借助 AI 辅助开发：
-- 在需求拆解 / 方案设计 / 编码 / 调试 / 文档等环节如何与 AI 协作；
-- AI 对开发效率或质量带来的实际帮助。
-完整对话日志见 logs/ 目录>
+## 三、功能与系统架构
+
+### 3.1 语音交互链路
+
+```text
+INMP441 麦克风
+    ↓ I2S0 RX
+robot_voice_capture
+    ↓
+MiMo V2.5 ASR
+    ↓
+openvela ai_agent
+    ↓
+MiMo V2.5 LLM → Skills / Tool Calls
+    ↓
+MiMo V2.5 TTS
+    ↓
+robot_audio_playback → I2S1 TX → MAX98357 → 扬声器
 ```
 
-> 提示：将会根据「作品本身 + 你的 README 说明 + `logs/` 里的 AI Coding 日志」来理解和评估你的作品，README 写清楚很重要。
+麦克风输入为 16 kHz、单声道、PCM16；语音输出为 24 kHz、单声道、PCM16。文本输入和语音输入共用同一个 Agent、Skill、Tool 和回复链路。
 
----
+### 3.2 常开语音与音乐策略
 
-## 附：仓库命名规范
+`voice_start` 开启后，系统进入常开语音输入状态，持续采集人声并交给 ASR 和 Agent 处理。人声进入录音流程时，Media 播放会收到停止请求，优先保证语音交互清晰。
 
-`contest2026_<编号>_<队伍名>` — 编号三位零填充；队名 slug（全小写、英文/拼音、连字符）。例：`contest2026_295_suanliheidong`。
-（仓库由组委会统一创建，**每队仅一个仓**，无需自行命名。）
+### 3.3 Agent Tool
+
+| Tool | 能力 | 主要实现 |
+|---|---|---|
+| `robot_move` | 前进、后退、左转、右转 | `robot_motion_tool.c` |
+| `robot_tail_wag` | 安全摇尾巴 | `robot_motion_tool.c` |
+| `robot_set_expression` | 设置持续表情 | `robot_expression_tool.c` |
+| `robot_react` | 短时情绪反应 | `robot_expression_tool.c` |
+| `robot_play_music` | 播放本地 WAV | `robot_music_player.c` |
+| `music_search` | 在线搜索音乐 | openvela Tool |
+| `music_play` | 调用 Media 播放 | openvela Tool |
+
+运动使用统一 worker 和 `robot_action_guard` 管理；LLM 只调用高层动作，不直接操作任意 PWM 或舵机角度。
+
+## 四、目录结构
+
+```text
+contest2026_295_suanliheidong/
+├── app/
+│   ├── robot_voice/        # 麦克风、ASR、LLM、TTS、音频播放和语音入口
+│   ├── robot_motion/       # 步态、运动 worker 和运动 Tool
+│   ├── robot_expression/   # 表情状态、OLED 绘制和表情 Tool
+│   ├── robotctl/            # 手工运动调试命令
+│   ├── robot_core/          # 动作保护和网络适配
+│   └── robot_proactive/     # Skill 安装和主动交互
+├── board/contest_board/     # ESP32-S3 板级初始化、I2S、音频桥和引脚定义
+├── skills/                  # Markdown 格式的自定义 Skill
+├── scripts/                 # Skill 打包等构建脚本
+├── docs/                    # 设计和调试文档
+├── logs/                    # AI Coding 对话和开发日志
+└── README.md                # 本作品说明
+```
+
+主要文件：
+
+| 文件 | 作用 |
+|---|---|
+| `app/robot_voice/robot_voice_main.c` | 语音入口、Agent 接入和语音诊断命令 |
+| `app/robot_voice/robot_voice_capture.c` | I2S0 麦克风采集 |
+| `app/robot_voice/mimo_asr.c` | MiMo ASR 请求 |
+| `app/robot_voice/mimo_tts.c` | MiMo TTS 请求 |
+| `app/robot_voice/robot_audio_playback.c` | I2S1 扬声器播放后端 |
+| `app/robot_voice/robot_music_player.c` | 本地 WAV 播放 Tool |
+| `app/robot_motion/robot_motion_tool.c` | 运动 Tool |
+| `app/robot_expression/robot_expression_tool.c` | 表情 Tool |
+| `board/contest_board/src/board_voice_audio.c` | Media 音频桥接和播放调度 |
+| `board/contest_board/src/contest_i2s.c` | I2S DMA 与数据适配 |
+| `board/contest_board/scripts/build_with_hal_backport.sh` | 固件构建入口 |
+| `scripts/generate_skill_bundle.py` | 将 Markdown Skill 打包进固件 |
+
+## 五、运行方式
+
+以下命令以 openvela 工作区位于 `/vela/openvela`、开发板串口为 `/dev/ttyUSB0` 为例。
+
+### 5.1 编译
+
+```bash
+cd /vela/openvela
+python3 -m venv myenv
+source myenv/bin/activate
+
+./build.sh vendor/openvela/boards/contest2026_295_board/configs/nsh --cmake menuconfig
+./build.sh vendor/openvela/boards/contest2026_295_board/configs/nsh --cmake savedefconfig
+
+chmod +x contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh
+contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh -j8
+```
+
+固件产物为 `nuttx/nuttx` 和 `nuttx/nuttx.bin`。需要完整清理时执行：
+
+```bash
+contest2026_295_suanliheidong/board/contest_board/scripts/build_with_hal_backport.sh distclean -j8
+```
+
+### 5.2 烧录
+
+烧录前让开发板进入下载模式，并确认串口设备名正确：
+
+```bash
+PORT=/dev/ttyUSB0
+python -m esptool --chip esp32s3 --port "$PORT" --baud 460800 \
+  write-flash --flash-size 16MB --flash-mode dio --flash-freq 40m \
+  0x000000 nuttx/nuttx.bin
+```
+
+如需清空 Flash，可先执行：
+
+```bash
+python -m esptool --chip esp32s3 --port "$PORT" erase_flash
+```
+
+烧录后松开 BOOT/GPIO0，按 EN/RESET，再打开串口：
+
+```bash
+picocom -b 115200 /dev/ttyUSB0
+```
+
+### 5.3 网络、模型和语音配置
+
+在串口中执行：
+
+```text
+nsh> ai_agent
+vela> set_wifi <SSID> <密码>
+vela> set_llm https://token-plan-cn.xiaomimimo.com/v1 mimo-v2.5 <API_KEY>
+vela> set_voice_asr mimo-v2.5-asr
+vela> set_voice_tts mimo-v2.5-tts
+```
+
+先用文本验证 Agent：
+
+```text
+vela> ask hello
+```
+
+再启动常开语音：
+
+```text
+vela> voice_start
+```
+
+此时直接说出指令或问题；测试完成后执行：
+
+```text
+vela> voice_stop
+```
+
+### 5.4 运动、表情和音乐测试
+
+```text
+vela> robotctl status
+vela> robotctl forward
+vela> robotctl left 1 2000
+vela> ask 向前走一步
+vela> ask 摇一下尾巴
+vela> ask 显示开心表情
+```
+
+测试固件内置的 `/etc/media/test.wav`：
+
+```text
+vela> mediad &
+vela> mediatool
+mediatool> open Music
+mediatool> prepare 0 url /etc/media/test.wav
+mediatool> start 0
+```
+
+### 5.5 关键日志
+
+| 日志前缀 | 用途 |
+|---|---|
+| `[BOOT-DIAG]`、`[BOARD-*]` | 系统和板级初始化 |
+| `[RV-CAP]`、`[RV-ASR]` | 麦克风采集和 ASR |
+| `[LLM-JSON]`、`[agent]` | LLM、Agent 和 Tool Call |
+| `[ROBOT-MOTION]`、`[POWER-SAFE]` | 运动和动作保护 |
+| `[RV-EXPR]`、`[RV-OLED]` | 表情和 OLED |
+| `[C-I2S]`、`[MEDIA-BRIDGE]`、`[media]` | I2S、Media 音频桥和播放状态 |
+| `[WLAN-TXDONE]` | WLAN 发送完成状态，用于定位网络与音频并发问题 |
+
+## 六、关键问题与解决方案
+
+### 6.1 WLAN 发送导致音频卡顿
+
+播放过程中会出现 `[WLAN-TXDONE]` 日志。问题并不是发送成功本身，而是网络发送、音频数据搬运和播放时序竞争，导致 Media 播放缓冲不足并触发 xrun。解决方式是在作品侧增加音频缓冲、预缓冲和播放调度，并让 Media bridge 对暂停、恢复、结束状态进行明确区分；没有修改官方 WLAN 源文件。
+
+### 6.2 停止播放后仍被恢复
+
+播放停止和 xrun 自动恢复可能存在竞态。作品侧把终止停止和非终止暂停区分开：收到终止停止后立即关闭当前播放会话，后续恢复请求不能重新打开已经结束的会话，从而回到 Agent/语音状态。
+
+### 6.3 人声打断音乐
+
+语音采集开始时主动停止 Media 播放，并保留音频播放状态，避免音乐与用户语音、TTS 同时输出。音乐播放音量在作品侧做了降低处理，提升语音交互时的舒适度。
+
+## 七、AI Coding 使用说明
+
+本作品在需求拆解、方案设计、编码、调试和文档整理环节均使用 AI 辅助开发，完整对话日志保存在 `logs/` 目录。
+
+### 7.1 需求拆解与方案设计
+
+围绕“常开语音、语音打断音乐、连续播放、机器人动作和表情反馈”等需求，先与 AI 拆分出语音采集、ASR、Agent、Tool、TTS、Media 和硬件执行几个状态域，再确定它们之间的消息和状态边界。
+
+### 7.2 编码与集成
+
+AI 协助生成和审查语音入口、ASR/TTS 调用、常开语音状态、Media bridge、动作 Tool、表情 Tool 和 Skill 打包相关代码。实现时遵循“只在作品侧增加适配和保护逻辑，不改官方 WLAN 文件”的约束，减少对 openvela 基础组件的侵入。
+
+### 7.3 日志调试
+
+针对 `[WLAN-TXDONE]`、`[MEDIA-BRIDGE]`、`xrun`、`underflow`、`voice_start` 和 Agent Tool 日志，AI 协助定位音频缓冲不足、暂停/恢复竞态和语音状态切换问题，并据此调整预缓冲、播放节奏、结束状态和日志点。
+
+### 7.4 文档与复现
+
+AI 协助整理目录结构、硬件连接、编译烧录命令、串口测试步骤、日志含义和已知限制，使评委可以从源码、固件和串口命令复现主要功能。
+
+## 八、硬件配置
+
+| 模块 | 配置 |
+|---|---|
+| 主控 | ESP32-S3 |
+| 麦克风 | INMP441，I2S0 RX |
+| 功放 | MAX98357，I2S1 TX |
+| OLED | SSD1306 128×64，I2C0 |
+| 舵机 | 4 路腿部舵机 + 1 路尾巴舵机，LEDC PWM |
+| 音频设备 | `/dev/audio/pcm0p` |
+
+主要引脚：
+
+| 用途 | GPIO |
+|---|---:|
+| 麦克风 BCLK / WS / DIN | 16 / 17 / 18 |
+| 功放 BCLK / WS / DOUT | 39 / 38 / 40 |
+| OLED SDA / SCL | 12 / 13 |
+| 右前腿 / 右后腿 | 9 / 10 |
+| 左后腿 / 左前腿 | 21 / 47 |
+| 尾巴 | 48 |
+
+## 九、作品总结
+
+```text
+听：INMP441 + MiMo ASR
+想：openvela ai_agent + MiMo LLM + Skills
+做：Robot Tools → 运动 / 表情 / 音乐
+说：MiMo TTS + MAX98357
+```
+
+VoicePet 在 ESP32-S3 上实现了从语音输入、模型推理到实体动作和语音输出的完整闭环，重点展示了 openvela 在 AI 硬件产品中的落地方式和可扩展性。

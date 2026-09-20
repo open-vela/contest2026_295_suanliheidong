@@ -1,0 +1,633 @@
+diff --git a/src/llm/llm_parse.c b/src/llm/llm_parse.c
+index 6e8b345..bfe6c57 100644
+--- a/src/llm/llm_parse.c
++++ b/src/llm/llm_parse.c
+@@ -37,12 +37,616 @@
+ #include "agent_config.h"
+ 
+ #include "cJSON.h"
++#include <nuttx/arch.h>
++#include <nuttx/mm/mm.h>
++#include "../../../../nuttx/mm/mm_heap/mm.h"
++#include <nuttx/mutex.h>
++#include <sched.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <syslog.h>
+ 
+ static const char* TAG = "llm_parse";
+ 
++enum agent_heap_gate_reason_e
++{
++    AGENT_HEAP_GATE_NONE = 0,
++    AGENT_HEAP_GATE_CONTEXT,
++    AGENT_HEAP_GATE_LOCK,
++    AGENT_HEAP_GATE_REGION,
++    AGENT_HEAP_GATE_NODE_ADDR,
++    AGENT_HEAP_GATE_NODE_ALIGN,
++    AGENT_HEAP_GATE_NODE_SIZE,
++    AGENT_HEAP_GATE_NODE_BOUNDS,
++    AGENT_HEAP_GATE_PREVFREE_FLAG,
++    AGENT_HEAP_GATE_PRECEDING_SIZE,
++    AGENT_HEAP_GATE_FREE_MIN_SIZE,
++    AGENT_HEAP_GATE_GUARD,
++    AGENT_HEAP_GATE_LINK,
++    AGENT_HEAP_GATE_FREELIST_NODE,
++    AGENT_HEAP_GATE_FREELIST_CYCLE,
++    AGENT_HEAP_GATE_FREELIST_TERM,
++    AGENT_HEAP_GATE_FREELIST_BIN,
++    AGENT_HEAP_GATE_FREELIST_MEMBERSHIP,
++};
++
++struct agent_heap_gate_result_s
++{
++    enum agent_heap_gate_reason_e reason;
++    int region;
++    int bin;
++    uintptr_t node;
++    size_t size;
++};
++
++static const char *agent_heap_gate_reason_name(
++    enum agent_heap_gate_reason_e reason)
++{
++    switch (reason)
++    {
++        case AGENT_HEAP_GATE_NONE:
++            return "NONE";
++        case AGENT_HEAP_GATE_CONTEXT:
++            return "CONTEXT";
++        case AGENT_HEAP_GATE_LOCK:
++            return "LOCK";
++        case AGENT_HEAP_GATE_REGION:
++            return "REGION";
++        case AGENT_HEAP_GATE_NODE_ADDR:
++            return "NODE_ADDR";
++        case AGENT_HEAP_GATE_NODE_ALIGN:
++            return "NODE_ALIGN";
++        case AGENT_HEAP_GATE_NODE_SIZE:
++            return "NODE_SIZE";
++        case AGENT_HEAP_GATE_NODE_BOUNDS:
++            return "NODE_BOUNDS";
++        case AGENT_HEAP_GATE_PREVFREE_FLAG:
++            return "PREVFREE_FLAG";
++        case AGENT_HEAP_GATE_PRECEDING_SIZE:
++            return "PRECEDING_SIZE";
++        case AGENT_HEAP_GATE_FREE_MIN_SIZE:
++            return "FREE_MIN_SIZE";
++        case AGENT_HEAP_GATE_GUARD:
++            return "GUARD";
++        case AGENT_HEAP_GATE_LINK:
++            return "LINK";
++        case AGENT_HEAP_GATE_FREELIST_NODE:
++            return "FREELIST_NODE";
++        case AGENT_HEAP_GATE_FREELIST_CYCLE:
++            return "FREELIST_CYCLE";
++        case AGENT_HEAP_GATE_FREELIST_TERM:
++            return "FREELIST_TERM";
++        case AGENT_HEAP_GATE_FREELIST_BIN:
++            return "FREELIST_BIN";
++        case AGENT_HEAP_GATE_FREELIST_MEMBERSHIP:
++            return "FREELIST_MEMBERSHIP";
++        default:
++            return "UNKNOWN";
++    }
++}
++
++static void agent_heap_gate_fail(struct agent_heap_gate_result_s *result,
++    enum agent_heap_gate_reason_e reason, int region, int bin,
++    const struct mm_freenode_s *node, size_t size)
++{
++    result->reason = reason;
++    result->region = region;
++    result->bin = bin;
++    result->node = (uintptr_t)node;
++    result->size = size;
++}
++
++static int agent_heap_gate_sentinel_index(const struct mm_heap_s *heap,
++    const struct mm_freenode_s *ptr)
++{
++    int i;
++
++    for (i = 0; i < MM_NNODES; i++)
++    {
++        if (ptr == &heap->mm_nodelist[i])
++        {
++            return i;
++        }
++    }
++
++    return -1;
++}
++
++#if CONFIG_MM_REGIONS > 1
++static int agent_heap_gate_region_count(const struct mm_heap_s *heap)
++{
++    return heap->mm_nregions;
++}
++#else
++static int agent_heap_gate_region_count(const struct mm_heap_s *heap)
++{
++    (void)heap;
++    return 1;
++}
++#endif
++
++static bool agent_heap_gate_add_count(size_t *value)
++{
++    if (*value == SIZE_MAX)
++    {
++        return false;
++    }
++
++    (*value)++;
++    return true;
++}
++
++/* Find a pointer at an exact physical node boundary. */
++static bool agent_heap_gate_find_node(const struct mm_heap_s *heap,
++    uintptr_t target, bool *is_free, size_t *size_out)
++{
++    int regions = agent_heap_gate_region_count(heap);
++    int region;
++
++    if (target == 0 || (target & (MM_ALIGN - 1)) != 0 ||
++        regions <= 0 || regions > CONFIG_MM_REGIONS)
++    {
++        return false;
++    }
++
++    for (region = 0; region < regions; region++)
++    {
++        uintptr_t start = (uintptr_t)heap->mm_heapstart[region];
++        uintptr_t end = (uintptr_t)heap->mm_heapend[region];
++        uintptr_t address = start;
++        size_t steps = 0;
++        size_t limit;
++
++        if (start == 0 || end <= start)
++        {
++            return false;
++        }
++
++        limit = (end - start) / MM_SIZEOF_ALLOCNODE + 1;
++        while (address < end)
++        {
++            struct mm_allocnode_s *node;
++            size_t size;
++            size_t remaining = end - address;
++
++            if (steps++ >= limit || remaining < MM_SIZEOF_ALLOCNODE ||
++                (address & (MM_ALIGN - 1)) != 0)
++            {
++                return false;
++            }
++
++            node = (struct mm_allocnode_s *)address;
++            size = MM_SIZEOF_NODE(node);
++            if (size < MM_SIZEOF_ALLOCNODE ||
++                (size & (MM_ALIGN - 1)) != 0 ||
++                size > remaining ||
++                size > UINTPTR_MAX - address)
++            {
++                return false;
++            }
++
++            if (address == target)
++            {
++                *is_free = MM_NODE_IS_FREE(node);
++                *size_out = size;
++                return true;
++            }
++
++            address += size;
++        }
++    }
++
++    return false;
++}
++
++static bool agent_heap_gate_physical_walk(struct mm_heap_s *heap,
++    struct agent_heap_gate_result_s *result, size_t *physical_nodes,
++    size_t *physical_free_nodes)
++{
++    int regions = agent_heap_gate_region_count(heap);
++    int region;
++
++    if (regions <= 0 || regions > CONFIG_MM_REGIONS)
++    {
++        agent_heap_gate_fail(result, AGENT_HEAP_GATE_REGION, -1, -1,
++            NULL, 0);
++        return false;
++    }
++
++    for (region = 0; region < regions; region++)
++    {
++        uintptr_t start = (uintptr_t)heap->mm_heapstart[region];
++        uintptr_t end = (uintptr_t)heap->mm_heapend[region];
++        uintptr_t address = start;
++        size_t previous_size = 0;
++        bool previous_free = false;
++        bool have_previous = false;
++        size_t steps = 0;
++        size_t limit;
++
++        if (start == 0 || end <= start ||
++            (start & (MM_ALIGN - 1)) != 0 ||
++            (end & (MM_ALIGN - 1)) != 0 ||
++            end - start < MM_SIZEOF_ALLOCNODE)
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_REGION, region, -1,
++                NULL, 0);
++            return false;
++        }
++
++        limit = (end - start) / MM_SIZEOF_ALLOCNODE + 1;
++        while (address < end)
++        {
++            struct mm_allocnode_s *node;
++            size_t size;
++            size_t remaining = end - address;
++            bool previous_free_flag;
++
++            if (steps++ >= limit || remaining < MM_SIZEOF_ALLOCNODE ||
++                (address & (MM_ALIGN - 1)) != 0)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, -1, (struct mm_freenode_s *)address, 0);
++                return false;
++            }
++
++            node = (struct mm_allocnode_s *)address;
++            size = MM_SIZEOF_NODE(node);
++            if (size < MM_SIZEOF_ALLOCNODE)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_SIZE,
++                    region, -1, (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            if ((size & (MM_ALIGN - 1)) != 0)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_ALIGN,
++                    region, -1, (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            if (size > remaining || size > UINTPTR_MAX - address)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, -1, (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            if (!have_previous &&
++                (size != MM_SIZEOF_ALLOCNODE ||
++                 !MM_NODE_IS_ALLOC(node) ||
++                 MM_PREVNODE_IS_FREE(node)))
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_GUARD, region, -1,
++                    (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            previous_free_flag = MM_PREVNODE_IS_FREE(node);
++            if (have_previous && previous_free_flag != previous_free)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PREVFREE_FLAG,
++                    region, -1, (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            if (have_previous && previous_free_flag &&
++                node->preceding != previous_size)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PRECEDING_SIZE,
++                    region, -1, (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            if (!agent_heap_gate_add_count(physical_nodes))
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                    region, -1, (struct mm_freenode_s *)node, size);
++                return false;
++            }
++
++            if (MM_NODE_IS_FREE(node))
++            {
++                if (size < MM_MIN_CHUNK ||
++                    !agent_heap_gate_add_count(physical_free_nodes))
++                {
++                    agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREE_MIN_SIZE,
++                        region, -1, (struct mm_freenode_s *)node, size);
++                    return false;
++                }
++            }
++
++            previous_size = size;
++            previous_free = MM_NODE_IS_FREE(node);
++            have_previous = true;
++            address += size;
++        }
++
++        if (address != end)
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_NODE_BOUNDS,
++                region, -1, (struct mm_freenode_s *)address, 0);
++            return false;
++        }
++
++        {
++            struct mm_allocnode_s *guard = (struct mm_allocnode_s *)end;
++            size_t guard_size = MM_SIZEOF_NODE(guard);
++            bool guard_previous_free = MM_PREVNODE_IS_FREE(guard);
++
++            if (guard_size != MM_SIZEOF_ALLOCNODE ||
++                !MM_NODE_IS_ALLOC(guard))
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_GUARD, region, -1,
++                    (struct mm_freenode_s *)guard, guard_size);
++                return false;
++            }
++
++            if (!have_previous || guard_previous_free != previous_free)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PREVFREE_FLAG,
++                    region, -1, (struct mm_freenode_s *)guard, guard_size);
++                return false;
++            }
++
++            if (guard_previous_free && guard->preceding != previous_size)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_PRECEDING_SIZE,
++                    region, -1, (struct mm_freenode_s *)guard, guard_size);
++                return false;
++            }
++        }
++    }
++
++    return true;
++}
++
++/* Walk one real bin. The next sentinel is the terminator except for the
++ * final bin, whose valid terminator is NULL. */
++static bool agent_heap_gate_walk_bin(const struct mm_heap_s *heap, int bin,
++    size_t physical_free_nodes, uintptr_t target, size_t *matches,
++    size_t *list_nodes, struct agent_heap_gate_result_s *result)
++{
++    struct mm_freenode_s *sentinel = &heap->mm_nodelist[bin];
++    struct mm_freenode_s *previous = sentinel;
++    struct mm_freenode_s *current = sentinel->flink;
++    size_t limit = physical_free_nodes == SIZE_MAX ?
++                   SIZE_MAX : physical_free_nodes + 1;
++    size_t steps = 0;
++
++    for (;;)
++    {
++        int sentinel_index;
++        bool is_free;
++        size_t size;
++
++        if (current == NULL)
++        {
++            if (bin != MM_NNODES - 1)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_TERM,
++                    -1, bin, previous, 0);
++                return false;
++            }
++
++            return true;
++        }
++
++        if (steps++ >= limit)
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_CYCLE,
++                -1, bin, current, 0);
++            return false;
++        }
++
++        sentinel_index = agent_heap_gate_sentinel_index(heap, current);
++        if (sentinel_index >= 0)
++        {
++            if (sentinel_index != bin + 1 ||
++                current->blink != previous ||
++                previous->flink != current)
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_TERM,
++                    -1, bin, current, 0);
++                return false;
++            }
++
++            return true;
++        }
++
++        if (!agent_heap_gate_find_node(heap, (uintptr_t)current,
++            &is_free, &size) || !is_free)
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_NODE,
++                -1, bin, current, 0);
++            return false;
++        }
++
++        if (size < MM_MIN_CHUNK || mm_size2ndx(size) != bin)
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_BIN,
++                -1, bin, current, size);
++            return false;
++        }
++
++        if (current->blink != previous || previous->flink != current)
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK,
++                -1, bin, current, size);
++            return false;
++        }
++
++        if (target != 0 && (uintptr_t)current == target)
++        {
++            if (!agent_heap_gate_add_count(matches))
++            {
++                agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_MEMBERSHIP,
++                    -1, bin, current, size);
++                return false;
++            }
++        }
++
++        if (list_nodes != NULL &&
++            !agent_heap_gate_add_count(list_nodes))
++        {
++            agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_MEMBERSHIP,
++                -1, bin, current, size);
++            return false;
++        }
++
++        previous = current;
++        current = current->flink;
++    }
++}
++
++static bool agent_heap_gate_walk_lists(const struct mm_heap_s *heap,
++    size_t physical_free_nodes, size_t *list_nodes,
++    struct agent_heap_gate_result_s *result)
++{
++    int bin;
++
++    if (heap->mm_nodelist[0].blink != NULL)
++    {
++        agent_heap_gate_fail(result, AGENT_HEAP_GATE_LINK, -1, 0,
++            &heap->mm_nodelist[0], 0);
++        return false;
++    }
++
++    *list_nodes = 0;
++    for (bin = 0; bin < MM_NNODES; bin++)
++    {
++        size_t matches = 0;
++
++        if (!agent_heap_gate_walk_bin(heap, bin, physical_free_nodes, 0,
++            &matches, list_nodes, result))
++        {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static bool agent_heap_gate_match_physical_free_nodes(
++    const struct mm_heap_s *heap, size_t physical_free_nodes,
++    struct agent_heap_gate_result_s *result)
++{
++    int regions = agent_heap_gate_region_count(heap);
++    int region;
++
++    for (region = 0; region < regions; region++)
++    {
++        uintptr_t address = (uintptr_t)heap->mm_heapstart[region];
++        uintptr_t end = (uintptr_t)heap->mm_heapend[region];
++
++        while (address < end)
++        {
++            struct mm_allocnode_s *node =
++                (struct mm_allocnode_s *)address;
++            size_t size = MM_SIZEOF_NODE(node);
++
++            if (MM_NODE_IS_FREE(node))
++            {
++                int bin;
++                size_t matches = 0;
++
++                for (bin = 0; bin < MM_NNODES; bin++)
++                {
++                    size_t list_nodes = 0;
++
++                    if (!agent_heap_gate_walk_bin(heap, bin,
++                        physical_free_nodes, address, &matches,
++                        &list_nodes, result))
++                    {
++                        return false;
++                    }
++                }
++
++                if (matches != 1)
++                {
++                    agent_heap_gate_fail(result,
++                        AGENT_HEAP_GATE_FREELIST_MEMBERSHIP, region,
++                        -1, (struct mm_freenode_s *)node, size);
++                    return false;
++                }
++            }
++
++            address += size;
++        }
++    }
++
++    return true;
++}
++
++static bool agent_heap_gate_check(struct agent_heap_gate_result_s *result)
++{
++    struct mm_heap_s *heap = USR_HEAP;
++    size_t physical_nodes = 0;
++    size_t physical_free_nodes = 0;
++    size_t list_nodes = 0;
++    bool pass;
++
++    memset(result, 0, sizeof(*result));
++    result->reason = AGENT_HEAP_GATE_NONE;
++    result->region = -1;
++    result->bin = -1;
++
++    if (heap == NULL || up_interrupt_context() || sched_idletask())
++    {
++        result->reason = AGENT_HEAP_GATE_CONTEXT;
++        return false;
++    }
++
++    if (nxrmutex_lock(&heap->mm_lock) < 0)
++    {
++        result->reason = AGENT_HEAP_GATE_LOCK;
++        return false;
++    }
++
++    pass = agent_heap_gate_physical_walk(heap, result,
++        &physical_nodes, &physical_free_nodes);
++    if (pass)
++    {
++        pass = agent_heap_gate_walk_lists(heap, physical_free_nodes,
++            &list_nodes, result);
++    }
++
++    if (pass && list_nodes != physical_free_nodes)
++    {
++        agent_heap_gate_fail(result, AGENT_HEAP_GATE_FREELIST_MEMBERSHIP,
++            -1, -1, NULL, list_nodes);
++        pass = false;
++    }
++
++    if (pass)
++    {
++        pass = agent_heap_gate_match_physical_free_nodes(heap,
++            physical_free_nodes, result);
++    }
++
++    nxrmutex_unlock(&heap->mm_lock);
++    return pass;
++}
++
++static bool agent_heap_gate_tools_parsed(void)
++{
++    struct agent_heap_gate_result_s result;
++    bool pass = agent_heap_gate_check(&result);
++
++    if (pass)
++    {
++        syslog(LOG_INFO, "[HEAP-GATE] TOOLS_PARSED PASS\n");
++    }
++    else
++    {
++        syslog(LOG_ERR, "[HEAP-GATE] TOOLS_PARSED FAIL reason=%s bin=%d\n",
++            agent_heap_gate_reason_name(result.reason), result.bin);
++    }
++
++    return pass;
++}
+ /* ── Tools format conversion ──────────────────────────────── */
+ 
+ cJSON* build_openai_tools_array(const char* tools_json)
+@@ -58,6 +662,10 @@ cJSON* build_openai_tools_array(const char* tools_json)
+         return NULL;
+     }
+ 
++    if (!agent_heap_gate_tools_parsed()) {
++        return NULL;
++    }
++
+     cJSON* tools_arr = cJSON_CreateArray();
+     cJSON* tool_def;
+ 
+

@@ -1,0 +1,12 @@
+#
+# Contest 2026 raw PCM voice echo application
+#
+
+config LVX_USE_DEMO_CONTEST2026_295_VOICE_ECHO
+	bool "Contest voice echo"
+	default n
+	depends on I2S && AUDIO
+	---help---
+		Build the voice_echo NSH builtin. The application records raw PCM from
+		I2S0; the recordmem command keeps a three-second capture in memory and
+		submits it directly to the ASR backend.

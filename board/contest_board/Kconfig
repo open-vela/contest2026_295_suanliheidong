@@ -1,11 +1,40 @@
 #
-# Contest 2026 team 000 board placeholder
+# ESP32-S3-WROOM-1-N16R8 contest board configuration
 #
 
-if ARCH_BOARD_CONTEST2026_000_BOARD
+if ARCH_BOARD_CUSTOM
 
-config ARCH_BOARD_CONTEST2026_000_BOARD_TAG
-	string "Board tag"
-	default "contest2026_000_board"
+comment "Contest 2026 team 295 ESP32-S3 board options"
 
-endif
+config CONTEST_BOARD_BUTTONS
+	bool "Contest board button capability"
+	default y
+	select ARCH_HAVE_BUTTONS
+	select ARCH_HAVE_IRQBUTTONS
+	---help---
+		Keep the board button capability configuration for compatibility.
+		Actual contest-board button registration is controlled separately.
+
+config CONTEST_BOARD_REGISTER_BUTTONS
+	bool "Register contest-board buttons at runtime"
+	default n
+	depends on CONTEST_BOARD_BUTTONS
+	---help---
+		Register board buttons and configure their GPIOs at runtime.
+
+config CONTEST_BOARD_I2S0_RX
+	bool "Contest-local I2S0 microphone RX lower-half"
+	default y if ESP32S3_I2S0_RX
+	depends on ESP32S3_I2S0_RX
+	---help---
+		Use the contest board's I2S0 RX lower-half for the INMP441
+		microphone.
+
+config CONTEST_BOARD_I2S1_TX
+	bool "Contest-local I2S1 speaker TX lower-half"
+	default y if ESP32S3_I2S1_TX
+	depends on ESP32S3_I2S1_TX
+	---help---
+		Use the contest board's I2S1 TX lower-half for the MAX98357 speaker.
+
+endif # ARCH_BOARD_CUSTOM

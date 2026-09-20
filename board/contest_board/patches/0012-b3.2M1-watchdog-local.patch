@@ -1,0 +1,502 @@
+diff --git a/src/agent_main.c b/src/agent_main.c
+index 9115a51..ca28ed5 100644
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -539,7 +539,7 @@ int ai_agent_main(int argc, char* argv[])
+ 
+     g_shutdown_requested = false;
+ 
+-    syslog(LOG_INFO, "[B3-DIAG] build=b3.1-message-bus-gate\n");
++    syslog(LOG_INFO, "[B3-DIAG] build=b3.2W-wlan-only\n");
+ 
+     struct timespec t0;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+@@ -593,6 +593,8 @@ int ai_agent_main(int argc, char* argv[])
+         if (rc != OK)
+             return -1;
+ 
++        network_sanitize_wlan0();
++
+         rc = memory_store_init();
+         BOOT_LOG_RC(&t0, "P1", "memory_store_init", rc);
+ 
+diff --git a/src/core/agent_loop.c b/src/core/agent_loop.c
+index 2933a4e..f5f9aa5 100644
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -46,7 +46,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
+-#include <sys/time.h>
++#include <time.h>
+ 
+ #include "cJSON.h"
+ 
+@@ -252,7 +252,7 @@ int agent_loop_bisect_heap_hold(size_t size)
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+ static char* handle_slash_remind(const agent_msg_t* msg);
+-static bool llm_call_timed_out(uint32_t latency_ms);
++static bool llm_call_timed_out(uint64_t latency_ms);
+ 
+ static int agent_loop_llm_chat_tools(const char *system_prompt,
+     cJSON *messages, const char *tools_json, llm_response_t *resp)
+@@ -280,31 +280,16 @@ static int agent_loop_llm_chat_tools(const char *system_prompt,
+ #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
+     "任务已完成，但生成确认消息超时。"
+ 
+-/* ── Clock-safe elapsed time calculation ───────────────────── */
+-
+-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
+-    const struct timeval* t1)
++static uint64_t agent_loop_monotonic_ms(void)
+ {
+-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
+-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
++    struct timespec ts;
+ 
+-    /* Clock went backwards (NTP jump, manual adjustment) */
+-    if (sec_diff < 0) {
+-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+         return 0;
+     }
+ 
+-    /* Microsecond borrow */
+-    if (usec_diff < 0) {
+-        sec_diff--;
+-        usec_diff += 1000000;
+-    }
+-
+-    if (sec_diff < 0) {
+-        return 0;
+-    }
+-
+-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
++    return (uint64_t)ts.tv_sec * 1000ULL
++        + (uint64_t)ts.tv_nsec / 1000000ULL;
+ }
+ 
+ /* ── Memory pool (pre-allocated tool output buffers) ───────── */
+@@ -1034,11 +1019,10 @@ static char* force_finish_reply(const char* system_prompt,
+ 
+     llm_response_t resp;
+     char* result = NULL;
+-    struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    uint64_t start_ms = agent_loop_monotonic_ms();
+     int err = agent_loop_llm_chat_tools(system_prompt, messages, NULL, &resp);
+-    gettimeofday(&t1, NULL);
+-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
++    uint64_t end_ms = agent_loop_monotonic_ms();
++    uint64_t ms = end_ms >= start_ms ? end_ms - start_ms : 0;
+     bool timed_out = llm_call_timed_out(ms);
+ 
+     if (err == OK && !timed_out && resp.text && resp.text_len > 0) {
+@@ -1185,9 +1169,9 @@ static bool check_tool_dup(const llm_response_t* resp,
+ 
+ /* Check if an LLM call exceeded the watchdog timeout.
+  * Returns true when latency_ms exceeds AGENT_LLM_TIMEOUT_SEC. */
+-static bool llm_call_timed_out(uint32_t latency_ms)
++static bool llm_call_timed_out(uint64_t latency_ms)
+ {
+-    return latency_ms > (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000;
++    return latency_ms > (uint64_t)AGENT_LLM_TIMEOUT_SEC * 1000ULL;
+ }
+ 
+ /* Handle TASK_COMPLETE: inject hint and do one final LLM call.
+@@ -1206,11 +1190,10 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
+ 
+     llm_response_t final_resp;
+     char* result = NULL;
+-    struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    uint64_t start_ms = agent_loop_monotonic_ms();
+     int err = agent_loop_llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+-    gettimeofday(&t1, NULL);
+-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
++    uint64_t end_ms = agent_loop_monotonic_ms();
++    uint64_t ms = end_ms >= start_ms ? end_ms - start_ms : 0;
+     bool timed_out = llm_call_timed_out(ms);
+ 
+     if (err == OK && !timed_out
+@@ -1254,7 +1237,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         complexity = llm_router_estimate_complexity(
+             msg->content, strlen(msg->content));
+     }
++    syslog(LOG_INFO, "[LLM-GATE] 1 router_enter\n");
+     int router_idx = llm_router_select(complexity);
++    syslog(LOG_INFO, "[LLM-GATE] 2 backend_selected idx=%d\n", router_idx);
+     if (router_idx >= 0) {
+         llm_router_apply(router_idx);
+     }
+@@ -1281,11 +1266,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         send_working_status(msg, iteration);
+ 
+         llm_response_t resp;
+-        struct timeval tv_start, tv_end;
+-        gettimeofday(&tv_start, NULL);
++        uint64_t start_ms = agent_loop_monotonic_ms();
+         int err = agent_loop_llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+-        gettimeofday(&tv_end, NULL);
+-        uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++        uint64_t end_ms = agent_loop_monotonic_ms();
++        uint64_t latency_ms = end_ms >= start_ms ? end_ms - start_ms : 0;
+ 
+         /* Router failover: on LLM call failure, try next backend */
+         if (err != OK && router_idx >= 0) {
+@@ -1300,11 +1284,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 router_idx = next_idx;
+                 trace.backend_idx = next_idx;
+                 llm_response_free(&resp);
+-                gettimeofday(&tv_start, NULL);
++                start_ms = agent_loop_monotonic_ms();
+                 err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                     tools_json, &resp);
+-                gettimeofday(&tv_end, NULL);
+-                latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++                end_ms = agent_loop_monotonic_ms();
++                latency_ms = end_ms >= start_ms ? end_ms - start_ms : 0;
+             }
+         }
+ 
+@@ -1312,11 +1296,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+             /* Distinguish timeout-induced failure from other errors */
+             if (llm_call_timed_out(latency_ms)) {
+                 syslog(LOG_WARNING,
+-                    "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
++                    "[%s] LLM watchdog: call failed after %" PRIu64 " ms "
+                     "(limit %ds)\n",
+                     TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+                 agent_trace_step(&trace, iteration, NULL,
+-                    latency_ms, 0);
++                    (uint32_t)latency_ms, 0);
+                 llm_response_free(&resp);
+                 final_text = strdup(LLM_TIMEOUT_MSG);
+                 watchdog_fired = true;
+@@ -1324,7 +1308,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+             }
+             syslog(LOG_ERR, "[%s] LLM call failed (iter %d)\n",
+                 TAG, iteration);
+-            agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
++            agent_trace_step(&trace, iteration, NULL,
++                (uint32_t)latency_ms, 0);
+             llm_response_free(&resp);
+             break;
+         }
+@@ -1336,10 +1321,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+          * but if the call barely completed, we still flag it. */
+         if (llm_call_timed_out(latency_ms)) {
+             syslog(LOG_WARNING,
+-                "[%s] LLM watchdog: call took %" PRIu32 " ms (limit %ds), "
++                "[%s] LLM watchdog: call took %" PRIu64 " ms (limit %ds), "
+                 "treating as timeout\n",
+                 TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+-            agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
++            agent_trace_step(&trace, iteration, NULL,
++                (uint32_t)latency_ms, 0);
+             llm_response_free(&resp);
+             final_text = strdup(LLM_TIMEOUT_MSG);
+             watchdog_fired = true;
+@@ -1349,7 +1335,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         /* Report success to router */
+         if (router_idx >= 0) {
+             llm_router_report_success(router_idx);
+-            llm_router_report_latency(router_idx, latency_ms);
++            llm_router_report_latency(router_idx, (uint32_t)latency_ms);
+             if (resp.total_tokens > 0) {
+                 llm_router_report_tokens(router_idx,
+                     resp.prompt_tokens, resp.completion_tokens);
+@@ -1400,24 +1386,24 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                     router_idx = prem_idx;
+                     trace.backend_idx = prem_idx;
+ 
+-                    gettimeofday(&tv_start, NULL);
++                    start_ms = agent_loop_monotonic_ms();
+                     err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                         tools_json, &resp);
+-                    gettimeofday(&tv_end, NULL);
+-                    latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++                    end_ms = agent_loop_monotonic_ms();
++                    latency_ms = end_ms >= start_ms ? end_ms - start_ms : 0;
+ 
+                     /* Watchdog check on cascade retry */
+                     if (llm_call_timed_out(latency_ms)) {
+                         syslog(LOG_WARNING,
+                             "[%s] LLM watchdog: cascade retry "
+-                            "took %" PRIu32 " ms\n",
++                            "took %" PRIu64 " ms\n",
+                             TAG, latency_ms);
+                         free(fallback_text);
+                         fallback_text = NULL;
+                         final_text = strdup(LLM_TIMEOUT_MSG);
+                         watchdog_fired = true;
+                         agent_trace_step(&trace, iteration, NULL,
+-                            latency_ms, 0);
++                            (uint32_t)latency_ms, 0);
+                         llm_response_free(&resp);
+                         break;
+                     }
+@@ -1432,21 +1418,23 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                         fallback_text = NULL;
+                     }
+                     agent_trace_step(&trace, iteration, NULL,
+-                        latency_ms, err == OK);
++                        (uint32_t)latency_ms, err == OK);
+                     llm_response_free(&resp);
+                     break;
+                 }
+                 /* No premium backend available — use cheap response */
+                 final_text = fallback_text;
+                 fallback_text = NULL;
+-                agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
++                agent_trace_step(&trace, iteration, NULL,
++                    (uint32_t)latency_ms, 1);
+                 break;
+             }
+ 
+             if (resp.text && resp.text_len > 0 && !final_text) {
+                 final_text = strdup(resp.text);
+             }
+-            agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
++            agent_trace_step(&trace, iteration, NULL,
++                (uint32_t)latency_ms, 1);
+             llm_response_free(&resp);
+             break;
+         }
+@@ -1457,7 +1445,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         /* Trace: log tool step */
+         agent_trace_step(&trace, iteration,
+             resp.call_count > 0 ? resp.calls[0].name : NULL,
+-            latency_ms, 1);
++            (uint32_t)latency_ms, 1);
+ 
+         /* Duplicate detection — break if stuck in a loop */
+         bool should_break = check_tool_dup(
+diff --git a/src/infra/network_manager.c b/src/infra/network_manager.c
+index fc6289d..962320e 100644
+--- a/src/infra/network_manager.c
++++ b/src/infra/network_manager.c
+@@ -18,6 +18,7 @@
+ #include "agent_compat.h"
+ 
+ #include <arpa/inet.h>
++#include <errno.h>
+ #include <ifaddrs.h>
+ #include <netinet/in.h>
+ #include <string.h>
+@@ -26,10 +27,61 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++#if !defined(CONFIG_ARCH_CHIP_GOLDFISH_ARM64) && \
++    !defined(CONFIG_ARCH_CHIP_QEMU_ARM) && \
++    !defined(CONFIG_AI_AGENT_NET_RPMSG)
++#include <netutils/netlib.h>
++#include <wireless/wapi.h>
++#endif
++
+ static const char* TAG = "netmgr";
+ 
+ static char s_ip_str[INET_ADDRSTRLEN] = "0.0.0.0";
+ 
++void network_sanitize_wlan0(void)
++{
++#if !defined(CONFIG_ARCH_CHIP_GOLDFISH_ARM64) && \
++    !defined(CONFIG_ARCH_CHIP_QEMU_ARM) && \
++    !defined(CONFIG_AI_AGENT_NET_RPMSG)
++    const char* dev = "wlan0";
++    int fd = wapi_make_socket();
++    int disconnect_rc = 0;
++    int disconnect_errno = 0;
++    int clear_rc = ERROR;
++    int clear_errno = 0;
++
++    if (fd < 0) {
++        disconnect_rc = fd;
++        disconnect_errno = -fd;
++        clear_rc = fd;
++        clear_errno = -fd;
++    } else {
++        /* This is the same WAPI disconnect implementation used by the
++         * `wapi disconnect wlan0` command.  Its public API is void, so the
++         * command's ioctl failures are reported by WAPI itself; the local
++         * return value records socket setup status only. */
++        errno = 0;
++        wpa_driver_wext_disconnect(fd, dev);
++        disconnect_errno = errno;
++
++        struct in_addr zero = { 0 };
++        clear_rc = wapi_set_ip(fd, dev, &zero);
++        clear_errno = clear_rc < 0 ? -clear_rc : 0;
++        close(fd);
++    }
++
++    syslog(LOG_INFO, "[WLAN-INIT] disconnect rc=%d errno=%d\n",
++        disconnect_rc, disconnect_errno);
++    syslog(LOG_INFO, "[WLAN-INIT] clear_ip rc=%d errno=%d\n",
++        clear_rc, clear_errno);
++#else
++    syslog(LOG_INFO, "[WLAN-INIT] disconnect rc=0 errno=0\n");
++    syslog(LOG_INFO, "[WLAN-INIT] clear_ip rc=0 errno=0\n");
++#endif
++
++    syslog(LOG_INFO, "[WLAN-INIT] sanitize done\n");
++}
++
+ bool network_is_connected(void)
+ {
+     struct ifaddrs* ifa_list = NULL;
+diff --git a/src/infra/network_manager.h b/src/infra/network_manager.h
+index df9b819..7c7a162 100644
+--- a/src/infra/network_manager.h
++++ b/src/infra/network_manager.h
+@@ -48,6 +48,9 @@ int network_wifi_connect(const char *iface, const char *ssid, const char *pass);
+ /** Re-connect using credentials saved in config_store (called at startup). */
+ int network_wifi_reconnect(void);
+ 
++/** Clear stale wlan0 runtime link and IPv4 state before startup reconnect. */
++void network_sanitize_wlan0(void);
++
+ /* ── RPMSG/TUN network interface ──────────────────────────────── */
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+ 
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index 75fcfea..7210eff 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -523,6 +523,9 @@ static int tls_write_request(tls_ctx_t* ctx,
+     syslog(LOG_INFO, "[TLS-PROBE] send begin bytes=%zu\n",
+         (size_t)pos + body_len);
+ 
++    const size_t total_bytes = (size_t)pos + body_len;
++    size_t total_sent = 0;
++
+     /* Write headers */
+     int written = 0;
+     while (written < pos) {
+@@ -534,10 +537,15 @@ static int tls_write_request(tls_ctx_t* ctx,
+         syslog(LOG_INFO, "[TLS-PROBE] send ret=%d errno=%d\n", ret, errno);
+         if (ret > 0) {
+             written += ret;
++            total_sent += (size_t)ret;
++            syslog(LOG_INFO,
++                "[TLS-PROBE] send progress sent=%zu/%zu\n",
++                total_sent, total_bytes);
+         } else if (ret == 0) {
+             free(hdr);
+             return VELA_TLS_ERR_WRITE;
+-        } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++        } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE
++            && ret != MBEDTLS_ERR_SSL_WANT_READ) {
+             free(hdr);
+             return VELA_TLS_ERR_WRITE;
+         }
+@@ -558,9 +566,14 @@ static int tls_write_request(tls_ctx_t* ctx,
+                 errno);
+             if (ret > 0) {
+                 bw += (size_t)ret;
++                total_sent += (size_t)ret;
++                syslog(LOG_INFO,
++                    "[TLS-PROBE] send progress sent=%zu/%zu\n",
++                    total_sent, total_bytes);
+             } else if (ret == 0) {
+                 return VELA_TLS_ERR_WRITE;
+-            } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++            } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE
++                && ret != MBEDTLS_ERR_SSL_WANT_READ) {
+                 return VELA_TLS_ERR_WRITE;
+             }
+         }
+diff --git a/src/llm/llm_proxy.c b/src/llm/llm_proxy.c
+index c54458e..c4fbd03 100644
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -694,6 +694,8 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     const char* tools_json, llm_response_t* resp)
+ {
+     memset(resp, 0, sizeof(*resp));
++
++    syslog(LOG_INFO, "[LLM-GATE] 4 proxy_enter\n");
+     s_diag_last_status = 0;
+     s_diag_last_stage = "router";
+ 
+@@ -708,10 +710,26 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     memcpy(llm_host, s_llm_host, sizeof(llm_host));
+     pthread_mutex_unlock(&s_llm_lock);
+ 
++    size_t model_len = strnlen(model, sizeof(model));
++    size_t key_len = strnlen(api_key, sizeof(api_key));
++    size_t host_len = strnlen(llm_host, sizeof(llm_host));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config_snapshot host_ptr=%p host_len=%zu "
++        "model_ptr=%p model_len=%zu key_ptr=%p key_len=%zu\n",
++        (void*)llm_host, host_len, (void*)model, model_len,
++        (void*)api_key, key_len);
++
++    if (model_len >= sizeof(model) || key_len >= sizeof(api_key)
++        || host_len >= sizeof(llm_host)) {
++        syslog(LOG_ERR, "[LLM-GATE] config snapshot unterminated\n");
++        return ERROR;
++    }
++
+     if (api_key[0] == '\0') {
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 5 request_build_begin\n");
+     cJSON* body = cJSON_CreateObject();
+     if (!body) {
+         syslog(LOG_ERR, "[AI-DOG-DIAG] llm request body allocation failed\n");
+@@ -773,6 +791,9 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 6 request_build_done bytes=%zu\n",
++        strlen(post_data));
++
+     syslog(LOG_INFO,
+         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
+         TAG, model, (int)strlen(post_data));
+@@ -793,6 +814,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         rb.len = 0;
+         status = 0;
+         s_diag_last_stage = "send";
++        syslog(LOG_INFO, "[LLM-GATE] 7 transport_enter\n");
+         err = llm_http_call(post_data, &rb, &status);
+         s_diag_last_status = status;
+         syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
+diff --git a/src/llm/llm_router.c b/src/llm/llm_router.c
+index aa586f2..fbf149e 100644
+--- a/src/llm/llm_router.c
++++ b/src/llm/llm_router.c
+@@ -518,8 +518,27 @@ int llm_router_apply(int index)
+         return -1;
+     }
+ 
++    size_t host_len = strnlen(b.host, sizeof(b.host));
++    size_t path_len = strnlen(b.path, sizeof(b.path));
++    size_t model_len = strnlen(b.model, sizeof(b.model));
++    size_t key_len = strnlen(b.api_key, sizeof(b.api_key));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config source host_ptr=%p host_len=%zu "
++        "path_ptr=%p path_len=%zu model_ptr=%p model_len=%zu "
++        "key_ptr=%p key_len=%zu\n",
++        (void*)b.host, host_len, (void*)b.path, path_len,
++        (void*)b.model, model_len, (void*)b.api_key, key_len);
++    if (host_len >= sizeof(b.host) || path_len >= sizeof(b.path)
++        || model_len >= sizeof(b.model) || key_len >= sizeof(b.api_key)) {
++        syslog(LOG_ERR, "[LLM-GATE] backend config unterminated\n");
++        return -1;
++    }
++
+     /* Atomic update — single lock acquisition in llm_proxy */
+-    llm_set_all(b.host, b.path, b.port, b.api_key, b.model);
++    if (llm_set_all(b.host, b.path, b.port, b.api_key, b.model) != OK) {
++        return -1;
++    }
++    syslog(LOG_INFO, "[LLM-GATE] 3 config_snapshot_ok\n");
+ 
+     return 0;
+ }

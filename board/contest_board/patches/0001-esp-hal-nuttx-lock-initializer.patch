@@ -1,0 +1,39 @@
+From 454d82c70edfa213fdae42af0052aa9fb419996c Mon Sep 17 00:00:00 2001
+From: Eren Terzioglu <eren.terzioglu@espressif.com>
+Date: Mon, 11 Aug 2025 12:32:57 +0200
+Subject: [PATCH] Change lock constant defines with SP macro
+
+Backport the upstream NuttX spinlock initializer compatibility fix to the
+HAL revision pinned by this board's NuttX integration.
+
+---
+ components/esp_hw_support/clk_ctrl_os.c | 2 +-
+ components/esp_hw_support/modem_clock.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/components/esp_hw_support/clk_ctrl_os.c b/components/esp_hw_support/clk_ctrl_os.c
+index a1bf3e2ee35..3ca126eaeb4 100644
+--- a/components/esp_hw_support/clk_ctrl_os.c
++++ b/components/esp_hw_support/clk_ctrl_os.c
+@@ -34,7 +34,7 @@ static const char *TAG = "clk_ctrl_os";
+             spin_unlock_irqrestore((lock), g_flags); \
+             g_flags = UINT32_MAX; \
+         } while(0)
+-#define LOCK_INITIALIZER_UNLOCKED       0
++#define LOCK_INITIALIZER_UNLOCKED       SP_UNLOCKED
+ 
+ typedef spinlock_t lock_type_t;
+ static irqstate_t g_flags = UINT32_MAX;
+diff --git a/components/esp_hw_support/modem_clock.c b/components/esp_hw_support/modem_clock.c
+index 5fbd59fe6b5..5c206b9fe93 100644
+--- a/components/esp_hw_support/modem_clock.c
++++ b/components/esp_hw_support/modem_clock.c
+@@ -35,7 +35,7 @@
+             spin_unlock_irqrestore((lock), g_flags); \
+             g_flags = UINT32_MAX; \
+         } while(0)
+-#define LOCK_INITIALIZER_UNLOCKED       0
++#define LOCK_INITIALIZER_UNLOCKED       SP_UNLOCKED
+ 
+ typedef spinlock_t lock_type_t;
+ static irqstate_t g_flags = UINT32_MAX;

@@ -1,0 +1,7 @@
+############################################################################
+# Independent Contest MiMo robot voice application
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_295_ROBOT_VOICE),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_295_robot_voice
+endif

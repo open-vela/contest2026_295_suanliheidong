@@ -1,0 +1,16 @@
+diff --git a/src/tools/tool_registry.c b/src/tools/tool_registry.c
+--- a/src/tools/tool_registry.c
++++ b/src/tools/tool_registry.c
+@@ -162,1 +162,9 @@
+-void tool_registry_rebuild_json(void) { build_tools_json_locked(); }
++void tool_registry_rebuild_json(void)
++{
++    /* Rebuild may be requested by the node/WebSocket task while the agent
++     * task is taking a snapshot.  The helper mutates and frees s_tools_json,
++     * so it must use the same lock as tool_registry_get_tools_json(). */
++    pthread_mutex_lock(&s_tools_mtx);
++    build_tools_json_locked();
++    pthread_mutex_unlock(&s_tools_mtx);
++}
+ 
+ int tool_registry_init(void)

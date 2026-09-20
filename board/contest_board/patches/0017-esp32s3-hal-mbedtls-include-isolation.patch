@@ -1,0 +1,64 @@
+diff --git a/arch/xtensa/src/esp32s3/Wireless.mk b/arch/xtensa/src/esp32s3/Wireless.mk
+index 74b6384e4b1..1caaa881827 100644
+--- a/arch/xtensa/src/esp32s3/Wireless.mk
++++ b/arch/xtensa/src/esp32s3/Wireless.mk
+@@ -61,6 +61,33 @@ INCLUDES += $(INCDIR_PREFIX)$(ARCH_SRCDIR)$(DELIM)chip$(DELIM)$(ESP_HAL_3RDPARTY
+ 
+ CFLAGS += $(DEFINE_PREFIX)MBEDTLS_CONFIG_FILE="<mbedtls/esp_config.h>"
+ 
++# Keep HAL mbedTLS objects on the HAL 3.6 header set.  The apps mbedTLS
++# include directories are global -I flags, so remove those two flags only
++# from the HAL mbedTLS object commands before adding the HAL paths.
++ESP_MBEDTLS_CFLAGS = \
++  -I chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)port$(DELIM)include \
++  -I chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)mbedtls$(DELIM)include \
++  -I chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)mbedtls$(DELIM)library \
++  -I chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)nuttx$(DELIM)include$(DELIM)mbedtls
++
++ESP_MBEDTLS_CFLAGS_REMOVE = \
++  $(INCDIR_PREFIX)$(APPDIR)$(DELIM)crypto$(DELIM)mbedtls$(DELIM)include \
++  $(INCDIR_PREFIX)$(APPDIR)$(DELIM)crypto$(DELIM)mbedtls$(DELIM)mbedtls$(DELIM)include
++
++ESP_MBEDTLS_LIBRARY_CSRCS = \
++  aes.c aria.c bignum_core.c bignum.c ccm.c cipher_wrap.c cipher.c cmac.c \
++  constant_time.c ctr_drbg.c ecp_curves.c ecp.c entropy.c gcm.c md.c \
++  pkcs5.c platform_util.c platform.c sha1.c sha3.c sha256.c sha512.c \
++  pk.c pk_wrap.c pkparse.c ecdsa.c asn1parse.c asn1write.c rsa.c md5.c \
++  oid.c pem.c hmac_drbg.c rsa_alt_helpers.c ecdh.c pk_ecc.c
++
++ESP_MBEDTLS_PORT_CSRCS = esp_hardware.c esp_mem.c esp_timing.c
++ESP_MBEDTLS_PORT_MD_CSRCS = esp_md.c
++
++$(foreach src,$(ESP_MBEDTLS_LIBRARY_CSRCS),$(eval chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)mbedtls$(DELIM)library$(DELIM)$(src)_CFLAGS += $(ESP_MBEDTLS_CFLAGS))$(eval chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)mbedtls$(DELIM)library$(DELIM)$(src)_CFLAGS_REMOVE := $(ESP_MBEDTLS_CFLAGS_REMOVE)))
++$(foreach src,$(ESP_MBEDTLS_PORT_CSRCS),$(eval chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)port$(DELIM)$(src)_CFLAGS += $(ESP_MBEDTLS_CFLAGS))$(eval chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)port$(DELIM)$(src)_CFLAGS_REMOVE := $(ESP_MBEDTLS_CFLAGS_REMOVE)))
++$(foreach src,$(ESP_MBEDTLS_PORT_MD_CSRCS),$(eval chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)port$(DELIM)md$(DELIM)$(src)_CFLAGS += $(ESP_MBEDTLS_CFLAGS))$(eval chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)mbedtls$(DELIM)port$(DELIM)md$(DELIM)$(src)_CFLAGS_REMOVE := $(ESP_MBEDTLS_CFLAGS_REMOVE)))
++
+ CHIP_CSRCS += aes.c
+ CHIP_CSRCS += aria.c
+ CHIP_CSRCS += bignum_core.c
+@@ -112,6 +139,12 @@ CHIP_CSRCS += esp_md.c
+ 
+ WIFI_WPA_SUPPLICANT = chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)wpa_supplicant
+ 
++ESP_WIFI_MBEDTLS_CSRCS = \
++  crypto_mbedtls-bignum.c crypto_mbedtls-ec.c crypto_mbedtls-rsa.c \
++  crypto_mbedtls.c fastpbkdf2.c tls_mbedtls.c
++
++$(foreach src,$(ESP_WIFI_MBEDTLS_CSRCS),$(eval $(WIFI_WPA_SUPPLICANT)$(DELIM)esp_supplicant$(DELIM)src$(DELIM)crypto$(DELIM)$(src)_CFLAGS += $(ESP_MBEDTLS_CFLAGS))$(eval $(WIFI_WPA_SUPPLICANT)$(DELIM)esp_supplicant$(DELIM)src$(DELIM)crypto$(DELIM)$(src)_CFLAGS_REMOVE := $(ESP_MBEDTLS_CFLAGS_REMOVE)))
++
+ CFLAGS += $(DEFINE_PREFIX)__ets__
+ CFLAGS += $(DEFINE_PREFIX)CONFIG_CRYPTO_MBEDTLS
+ CFLAGS += $(DEFINE_PREFIX)CONFIG_ECC
+diff --git a/tools/Config.mk b/tools/Config.mk
+index 58acaf35a45..508eb37e4e7 100644
+--- a/tools/Config.mk
++++ b/tools/Config.mk
+@@ -308,7 +308,7 @@ endef
+ 
+ define COMPILE
+ 	$(ECHO_BEGIN)"CC: $1 "
+-	$(Q) $(CCACHE) $(CC) -c $(CFLAGS) $3 $($(strip $1)_CFLAGS) $1 -o $2
++	$(Q) $(CCACHE) $(CC) -c $(if $($(strip $1)_CFLAGS_REMOVE),$(subst $($(strip $1)_CFLAGS_REMOVE),,$(CFLAGS)),$(CFLAGS)) $3 $($(strip $1)_CFLAGS) $1 -o $2
+ 	$(ECHO_END)
+ 	$(if $(CONFIG_LIB_SYSCALL_WRAPPER), $(WRAPSYMBOL) $2 @$(TOPDIR)$(DELIM)syscall$(DELIM)wrapsymbol.cmd)
+ endef

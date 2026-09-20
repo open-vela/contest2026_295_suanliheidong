@@ -1,0 +1,484 @@
+diff --git a/src/agent_main.c b/src/agent_main.c
+index 9115a51..b2aa73f 100644
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -539,7 +539,7 @@ int ai_agent_main(int argc, char* argv[])
+ 
+     g_shutdown_requested = false;
+ 
+-    syslog(LOG_INFO, "[B3-DIAG] build=b3.1-message-bus-gate\n");
++    syslog(LOG_INFO, "[B3-DIAG] build=b3.2M-monotonic-only\n");
+ 
+     struct timespec t0;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+diff --git a/src/core/agent_loop.c b/src/core/agent_loop.c
+index 2933a4e..1efcbfb 100644
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -46,7 +46,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
+-#include <sys/time.h>
++#include <time.h>
+ 
+ #include "cJSON.h"
+ 
+@@ -252,17 +252,30 @@ int agent_loop_bisect_heap_hold(size_t size)
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+ static char* handle_slash_remind(const agent_msg_t* msg);
+-static bool llm_call_timed_out(uint32_t latency_ms);
++static bool llm_call_timed_out(uint64_t latency_ms);
+ 
+ static int agent_loop_llm_chat_tools(const char *system_prompt,
+     cJSON *messages, const char *tools_json, llm_response_t *resp)
+ {
+     int rc;
++    uint64_t start_mono_ms = agent_trace_monotonic_ms();
++    time_t start_realtime = time(NULL);
+ 
++    syslog(LOG_INFO,
++        "[TIME-DIAG] llm start mono_ms=%" PRIu64 " realtime=%ld\n",
++        start_mono_ms, (long)start_realtime);
+     syslog(LOG_INFO, "[ASK-DIAG] llm_begin\n");
+     agent_loop_heap_diag("LLM_PRE");
+     rc = llm_chat_tools(system_prompt, messages, tools_json, resp);
+     agent_loop_heap_diag("LLM_POST");
++    uint64_t end_mono_ms = agent_trace_monotonic_ms();
++    time_t end_realtime = time(NULL);
++    uint64_t elapsed_ms = end_mono_ms >= start_mono_ms
++        ? end_mono_ms - start_mono_ms : 0;
++    syslog(LOG_INFO,
++        "[TIME-DIAG] llm end mono_ms=%" PRIu64 " elapsed_ms=%" PRIu64
++        " realtime=%ld\n", end_mono_ms, elapsed_ms,
++        (long)end_realtime);
+     syslog(LOG_INFO, "[ASK-DIAG] llm_done rc=%d http=%d\n", rc,
+         llm_proxy_diag_last_status());
+     if (rc != OK) {
+@@ -280,33 +293,6 @@ static int agent_loop_llm_chat_tools(const char *system_prompt,
+ #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
+     "任务已完成，但生成确认消息超时。"
+ 
+-/* ── Clock-safe elapsed time calculation ───────────────────── */
+-
+-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
+-    const struct timeval* t1)
+-{
+-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
+-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
+-
+-    /* Clock went backwards (NTP jump, manual adjustment) */
+-    if (sec_diff < 0) {
+-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
+-        return 0;
+-    }
+-
+-    /* Microsecond borrow */
+-    if (usec_diff < 0) {
+-        sec_diff--;
+-        usec_diff += 1000000;
+-    }
+-
+-    if (sec_diff < 0) {
+-        return 0;
+-    }
+-
+-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
+-}
+-
+ /* ── Memory pool (pre-allocated tool output buffers) ───────── */
+ 
+ static agent_mem_pool_t s_tool_pool;
+@@ -1034,11 +1020,10 @@ static char* force_finish_reply(const char* system_prompt,
+ 
+     llm_response_t resp;
+     char* result = NULL;
+-    struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    uint64_t t0 = agent_trace_monotonic_ms();
+     int err = agent_loop_llm_chat_tools(system_prompt, messages, NULL, &resp);
+-    gettimeofday(&t1, NULL);
+-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
++    uint64_t t1 = agent_trace_monotonic_ms();
++    uint64_t ms = t1 >= t0 ? t1 - t0 : 0;
+     bool timed_out = llm_call_timed_out(ms);
+ 
+     if (err == OK && !timed_out && resp.text && resp.text_len > 0) {
+@@ -1185,9 +1170,9 @@ static bool check_tool_dup(const llm_response_t* resp,
+ 
+ /* Check if an LLM call exceeded the watchdog timeout.
+  * Returns true when latency_ms exceeds AGENT_LLM_TIMEOUT_SEC. */
+-static bool llm_call_timed_out(uint32_t latency_ms)
++static bool llm_call_timed_out(uint64_t latency_ms)
+ {
+-    return latency_ms > (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000;
++    return latency_ms > (uint64_t)AGENT_LLM_TIMEOUT_SEC * 1000ULL;
+ }
+ 
+ /* Handle TASK_COMPLETE: inject hint and do one final LLM call.
+@@ -1206,11 +1191,10 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
+ 
+     llm_response_t final_resp;
+     char* result = NULL;
+-    struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    uint64_t t0 = agent_trace_monotonic_ms();
+     int err = agent_loop_llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+-    gettimeofday(&t1, NULL);
+-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
++    uint64_t t1 = agent_trace_monotonic_ms();
++    uint64_t ms = t1 >= t0 ? t1 - t0 : 0;
+     bool timed_out = llm_call_timed_out(ms);
+ 
+     if (err == OK && !timed_out
+@@ -1254,7 +1238,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         complexity = llm_router_estimate_complexity(
+             msg->content, strlen(msg->content));
+     }
++    syslog(LOG_INFO, "[LLM-GATE] 1 router_enter\n");
+     int router_idx = llm_router_select(complexity);
++    syslog(LOG_INFO, "[LLM-GATE] 2 backend_selected idx=%d\n", router_idx);
+     if (router_idx >= 0) {
+         llm_router_apply(router_idx);
+     }
+@@ -1281,11 +1267,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+         send_working_status(msg, iteration);
+ 
+         llm_response_t resp;
+-        struct timeval tv_start, tv_end;
+-        gettimeofday(&tv_start, NULL);
++        uint64_t tv_start = agent_trace_monotonic_ms();
+         int err = agent_loop_llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+-        gettimeofday(&tv_end, NULL);
+-        uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++        uint64_t tv_end = agent_trace_monotonic_ms();
++        uint64_t latency_ms = tv_end >= tv_start ? tv_end - tv_start : 0;
+ 
+         /* Router failover: on LLM call failure, try next backend */
+         if (err != OK && router_idx >= 0) {
+@@ -1300,11 +1285,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 router_idx = next_idx;
+                 trace.backend_idx = next_idx;
+                 llm_response_free(&resp);
+-                gettimeofday(&tv_start, NULL);
++                tv_start = agent_trace_monotonic_ms();
+                 err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                     tools_json, &resp);
+-                gettimeofday(&tv_end, NULL);
+-                latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++                tv_end = agent_trace_monotonic_ms();
++                latency_ms = tv_end >= tv_start ? tv_end - tv_start : 0;
+             }
+         }
+ 
+@@ -1312,7 +1297,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+             /* Distinguish timeout-induced failure from other errors */
+             if (llm_call_timed_out(latency_ms)) {
+                 syslog(LOG_WARNING,
+-                    "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
++                    "[%s] LLM watchdog: call failed after %" PRIu64 " ms "
+                     "(limit %ds)\n",
+                     TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+                 agent_trace_step(&trace, iteration, NULL,
+@@ -1336,7 +1321,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+          * but if the call barely completed, we still flag it. */
+         if (llm_call_timed_out(latency_ms)) {
+             syslog(LOG_WARNING,
+-                "[%s] LLM watchdog: call took %" PRIu32 " ms (limit %ds), "
++                "[%s] LLM watchdog: call took %" PRIu64 " ms (limit %ds), "
+                 "treating as timeout\n",
+                 TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
+@@ -1400,17 +1385,17 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                     router_idx = prem_idx;
+                     trace.backend_idx = prem_idx;
+ 
+-                    gettimeofday(&tv_start, NULL);
++                    tv_start = agent_trace_monotonic_ms();
+                     err = agent_loop_llm_chat_tools(sys_prompt, messages,
+                         tools_json, &resp);
+-                    gettimeofday(&tv_end, NULL);
+-                    latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
++                    tv_end = agent_trace_monotonic_ms();
++                    latency_ms = tv_end >= tv_start ? tv_end - tv_start : 0;
+ 
+                     /* Watchdog check on cascade retry */
+                     if (llm_call_timed_out(latency_ms)) {
+                         syslog(LOG_WARNING,
+                             "[%s] LLM watchdog: cascade retry "
+-                            "took %" PRIu32 " ms\n",
++                            "took %" PRIu64 " ms\n",
+                             TAG, latency_ms);
+                         free(fallback_text);
+                         fallback_text = NULL;
+diff --git a/src/core/agent_trace.c b/src/core/agent_trace.c
+index 0083f18..a678989 100644
+--- a/src/core/agent_trace.c
++++ b/src/core/agent_trace.c
+@@ -17,13 +17,27 @@
+ #include "core/agent_trace.h"
+ 
+ #include <stdio.h>
++#include <inttypes.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/time.h>
+ #include <syslog.h>
++#include <time.h>
+ 
+ static const char* TAG = "trace";
+ 
++uint64_t agent_trace_monotonic_ms(void)
++{
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++        return 0;
++    }
++
++    return (uint64_t)ts.tv_sec * 1000ULL
++        + (uint64_t)ts.tv_nsec / 1000000ULL;
++}
++
+ static const char* status_str(int status)
+ {
+     switch (status) {
+@@ -48,6 +62,7 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
+     memset(t, 0, sizeof(*t));
+     gettimeofday(&tv, NULL);
+     t->start_ts = (uint32_t)tv.tv_sec;
++    t->start_mono_ms = agent_trace_monotonic_ms();
+ 
+     /* Generate run_id: lower 32 bits of time + rand for uniqueness */
+     snprintf(t->run_id, sizeof(t->run_id), "%08x%08x",
+@@ -70,7 +85,7 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
+ }
+ 
+ void agent_trace_step(agent_trace_t* t, int iteration,
+-    const char* tool_name, uint32_t latency_ms,
++    const char* tool_name, uint64_t latency_ms,
+     int llm_ok)
+ {
+     t->iteration = iteration;
+@@ -80,28 +95,27 @@ void agent_trace_step(agent_trace_t* t, int iteration,
+     }
+ 
+     syslog(LOG_INFO,
+-        "[%s:%s] iter=%d tool=%s latency=%ums llm=%s backend=%d",
++        "[%s:%s] iter=%d tool=%s latency=%" PRIu64 "ms llm=%s backend=%d",
+         TAG, t->run_id, iteration,
+         (tool_name && tool_name[0]) ? tool_name : "(none)",
+-        (unsigned)latency_ms,
++        latency_ms,
+         llm_ok ? "ok" : "fail",
+         t->backend_idx);
+ }
+ 
+ void agent_trace_end(agent_trace_t* t, int status)
+ {
+-    struct timeval tv;
+-
+-    gettimeofday(&tv, NULL);
+     t->status = status;
+ 
+-    uint32_t elapsed = (uint32_t)tv.tv_sec - t->start_ts;
++    uint64_t now_mono_ms = agent_trace_monotonic_ms();
++    uint64_t elapsed_ms = now_mono_ms >= t->start_mono_ms
++        ? now_mono_ms - t->start_mono_ms : 0;
+ 
+     syslog(LOG_INFO,
+         "[%s:%s] END status=%s iters=%d tools=%d "
+-        "llm_ms=%u elapsed=%us backend=%d",
++        "llm_ms=%" PRIu64 " elapsed_ms=%" PRIu64 " backend=%d",
+         TAG, t->run_id, status_str(status),
+         t->iteration + 1, t->total_tool_calls,
+-        (unsigned)t->total_latency_ms, (unsigned)elapsed,
++        t->total_latency_ms, elapsed_ms,
+         t->backend_idx);
+ }
+diff --git a/src/core/agent_trace.h b/src/core/agent_trace.h
+index f6434ba..65a8cc4 100644
+--- a/src/core/agent_trace.h
++++ b/src/core/agent_trace.h
+@@ -46,10 +46,11 @@ typedef struct {
+     char run_id[17]; /* 16 hex chars + NUL */
+     char chat_id[64];
+     char channel[16];
+-    uint32_t start_ts; /* epoch seconds */
++    uint32_t start_ts; /* epoch seconds, used for run-id uniqueness */
++    uint64_t start_mono_ms; /* monotonic start time for elapsed duration */
+     int iteration; /* current iteration number */
+     int backend_idx; /* current router backend index */
+-    uint32_t total_latency_ms; /* cumulative LLM latency */
++    uint64_t total_latency_ms; /* cumulative LLM latency */
+     int total_tool_calls; /* cumulative tool call count */
+     int status; /* AGENT_TRACE_* */
+ } agent_trace_t;
+@@ -64,9 +65,12 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
+  * Log one iteration step (after each LLM call + tool execution).
+  */
+ void agent_trace_step(agent_trace_t* t, int iteration,
+-    const char* tool_name, uint32_t latency_ms,
++    const char* tool_name, uint64_t latency_ms,
+     int llm_ok);
+ 
++/** Return monotonic milliseconds for duration and timeout measurements. */
++uint64_t agent_trace_monotonic_ms(void);
++
+ /**
+  * End the trace and log the summary.
+  */
+diff --git a/src/llm/llm_proxy.c b/src/llm/llm_proxy.c
+index c54458e..c4fbd03 100644
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -694,6 +694,8 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     const char* tools_json, llm_response_t* resp)
+ {
+     memset(resp, 0, sizeof(*resp));
++
++    syslog(LOG_INFO, "[LLM-GATE] 4 proxy_enter\n");
+     s_diag_last_status = 0;
+     s_diag_last_stage = "router";
+ 
+@@ -708,10 +710,26 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+     memcpy(llm_host, s_llm_host, sizeof(llm_host));
+     pthread_mutex_unlock(&s_llm_lock);
+ 
++    size_t model_len = strnlen(model, sizeof(model));
++    size_t key_len = strnlen(api_key, sizeof(api_key));
++    size_t host_len = strnlen(llm_host, sizeof(llm_host));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config_snapshot host_ptr=%p host_len=%zu "
++        "model_ptr=%p model_len=%zu key_ptr=%p key_len=%zu\n",
++        (void*)llm_host, host_len, (void*)model, model_len,
++        (void*)api_key, key_len);
++
++    if (model_len >= sizeof(model) || key_len >= sizeof(api_key)
++        || host_len >= sizeof(llm_host)) {
++        syslog(LOG_ERR, "[LLM-GATE] config snapshot unterminated\n");
++        return ERROR;
++    }
++
+     if (api_key[0] == '\0') {
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 5 request_build_begin\n");
+     cJSON* body = cJSON_CreateObject();
+     if (!body) {
+         syslog(LOG_ERR, "[AI-DOG-DIAG] llm request body allocation failed\n");
+@@ -773,6 +791,9 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         return ERROR;
+     }
+ 
++    syslog(LOG_INFO, "[LLM-GATE] 6 request_build_done bytes=%zu\n",
++        strlen(post_data));
++
+     syslog(LOG_INFO,
+         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
+         TAG, model, (int)strlen(post_data));
+@@ -793,6 +814,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+         rb.len = 0;
+         status = 0;
+         s_diag_last_stage = "send";
++        syslog(LOG_INFO, "[LLM-GATE] 7 transport_enter\n");
+         err = llm_http_call(post_data, &rb, &status);
+         s_diag_last_status = status;
+         syslog(LOG_INFO, "[ASK-DIAG] llm call return rc=%d http=%d\n", err,
+diff --git a/src/llm/llm_router.c b/src/llm/llm_router.c
+index aa586f2..845e00e 100644
+--- a/src/llm/llm_router.c
++++ b/src/llm/llm_router.c
+@@ -39,6 +39,17 @@
+ 
+ static const char* TAG = "llm_router";
+ 
++static uint64_t router_monotonic_sec(void)
++{
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++        return 0;
++    }
++
++    return (uint64_t)ts.tv_sec;
++}
++
+ /* Backend storage */
+ static llm_backend_t s_backends[LLM_ROUTER_MAX_BACKENDS];
+ static int s_backend_count = 0;
+@@ -321,8 +332,8 @@ static int router_select_internal(llm_complexity_t complexity,
+     int best_idx = -1;
+     int best_score = -1;
+     int fallback_idx = -1;          /* least-backed-off backend */
+-    uint32_t fallback_until = UINT32_MAX;
+-    uint32_t now = (uint32_t)time(NULL);
++    uint64_t fallback_until = UINT64_MAX;
++    uint64_t now = router_monotonic_sec();
+ 
+     for (int i = 0; i < LLM_ROUTER_MAX_BACKENDS; i++) {
+         llm_backend_t* b = &s_backends[i];
+@@ -438,7 +449,7 @@ void llm_router_report_failure(int index)
+     pthread_mutex_lock(&s_router_lock);
+ 
+     llm_backend_t* b = &s_backends[index];
+-    uint32_t now = (uint32_t)time(NULL);
++    uint64_t now = router_monotonic_sec();
+ 
+     /* Debounce: only count if outside rapid-fire window */
+     if (now - b->last_fail_ts >= BACKOFF_DEBOUNCE_SEC) {
+@@ -518,8 +529,27 @@ int llm_router_apply(int index)
+         return -1;
+     }
+ 
++    size_t host_len = strnlen(b.host, sizeof(b.host));
++    size_t path_len = strnlen(b.path, sizeof(b.path));
++    size_t model_len = strnlen(b.model, sizeof(b.model));
++    size_t key_len = strnlen(b.api_key, sizeof(b.api_key));
++    syslog(LOG_INFO,
++        "[LLM-GATE] config source host_ptr=%p host_len=%zu "
++        "path_ptr=%p path_len=%zu model_ptr=%p model_len=%zu "
++        "key_ptr=%p key_len=%zu\n",
++        (void*)b.host, host_len, (void*)b.path, path_len,
++        (void*)b.model, model_len, (void*)b.api_key, key_len);
++    if (host_len >= sizeof(b.host) || path_len >= sizeof(b.path)
++        || model_len >= sizeof(b.model) || key_len >= sizeof(b.api_key)) {
++        syslog(LOG_ERR, "[LLM-GATE] backend config unterminated\n");
++        return -1;
++    }
++
+     /* Atomic update — single lock acquisition in llm_proxy */
+-    llm_set_all(b.host, b.path, b.port, b.api_key, b.model);
++    if (llm_set_all(b.host, b.path, b.port, b.api_key, b.model) != OK) {
++        return -1;
++    }
++    syslog(LOG_INFO, "[LLM-GATE] 3 config_snapshot_ok\n");
+ 
+     return 0;
+ }
+@@ -547,7 +577,7 @@ void llm_router_report_tokens(int index, int prompt_tokens,
+ char* llm_router_status_json(void)
+ {
+     pthread_mutex_lock(&s_router_lock);
+-    uint32_t now = (uint32_t)time(NULL);
++    uint64_t now = router_monotonic_sec();
+ 
+     cJSON* root = cJSON_CreateObject();
+     if (!root) {
+diff --git a/src/llm/llm_router.h b/src/llm/llm_router.h
+index e8b8d6d..3f03b35 100644
+--- a/src/llm/llm_router.h
++++ b/src/llm/llm_router.h
+@@ -64,8 +64,8 @@ typedef struct {
+     int fail_count; /* Consecutive failures */
+ 
+     /* P0 improvements: metrics + backoff (from scout report 2026-03-21) */
+-    uint32_t last_fail_ts; /* Epoch seconds of last failure */
+-    uint32_t backoff_until; /* Don't use until this epoch */
++    uint64_t last_fail_ts; /* Monotonic seconds of last failure */
++    uint64_t backoff_until; /* Don't use until this monotonic time */
+     uint32_t total_calls; /* Lifetime call count */
+     uint32_t total_failures; /* Lifetime failure count */
+     uint32_t avg_latency_ms; /* Exponential moving average */

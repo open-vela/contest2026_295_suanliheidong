@@ -1,0 +1,7 @@
+config LVX_USE_DEMO_CONTEST2026_295_ROBOT_AGENTCTL
+	bool "Contest robot proactive control"
+	default y
+	depends on EXAMPLES_AI_AGENT_VELA
+	depends on LVX_USE_DEMO_CONTEST2026_295_ROBOT_VOICE
+	---help---
+		Build the robot_agentctl proactive runtime diagnostic command.

@@ -1,0 +1,110 @@
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -539,6 +539,8 @@
+ 
+     g_shutdown_requested = false;
+ 
++    syslog(LOG_INFO, "[B3-DIAG] build=b3.1-message-bus-gate\n");
++
+     struct timespec t0;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+ 
+--- a/src/channels/nsh_commands.c
++++ b/src/channels/nsh_commands.c
+@@ -640,8 +640,13 @@
+     strncpy(msg.channel, "cli", sizeof(msg.channel) - 1);
+     strncpy(msg.chat_id, "console", sizeof(msg.chat_id) - 1);
+     msg.content = strdup(content);
++    int rc = ERROR;
++    syslog(LOG_INFO,
++        "[BUS-DIAG] producer push begin source=cli:console len=%zu\n",
++        strlen(content));
+     if (msg.content)
+-        message_bus_push_inbound(&msg);
++        rc = message_bus_push_inbound(&msg);
++    syslog(LOG_INFO, "[BUS-DIAG] producer push end rc=%d\n", rc);
+     printf("Sent to agent: %s\n", content);
+     syslog(LOG_INFO, "[agent] ask: %s\n", content);
+ }
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -1645,6 +1645,8 @@
+ 
+     agent_mem_status_t mem_st;
+ 
++    syslog(LOG_INFO, "[BUS-DIAG] consumer entered\n");
++
+     agent_loop_heap_diag("STARTUP");
+ 
+     agent_mem_get_status(&mem_st);
+@@ -1733,8 +1735,14 @@
+ 
+     while (!agent_shutdown_requested()) {
+         agent_msg_t msg;
++        syslog(LOG_INFO, "[BUS-DIAG] consumer waiting\n");
+         int err = message_bus_pop_inbound(&msg, UINT32_MAX);
+ 
++        syslog(LOG_INFO,
++            "[BUS-DIAG] consumer pop rc=%d source=%s len=%zu\n", err,
++            err == OK ? msg.channel : "<none>",
++            err == OK && msg.content ? strlen(msg.content) : 0);
++
+         if (err != OK) {
+             continue;
+         }
+--- a/src/core/message_bus.c
++++ b/src/core/message_bus.c
+@@ -49,6 +49,7 @@
+ static msg_queue_t g_outbound_queue;
+ static bool g_initialized = false;
+ static volatile bool g_bus_shutdown = false;
++static unsigned int g_init_count;
+ 
+ /* -- Private Functions ---------------------------------------------------- */
+ 
+@@ -176,9 +177,12 @@
+     msg_queue_init(&g_outbound_queue);
+     g_bus_shutdown = false;
+     g_initialized = true;
++    g_init_count++;
+ 
+     syslog(LOG_INFO, "[%s] Message bus initialized (depth %d)\n",
+            TAG, AGENT_BUS_QUEUE_LEN);
++    syslog(LOG_INFO, "[BUS-DIAG] init bus=%p count=%u\n",
++           (void*)&g_inbound_queue, g_init_count);
+     return OK;
+ }
+ 
+@@ -210,20 +214,30 @@
+ 
+ int message_bus_push_inbound(const agent_msg_t *msg)
+ {
++    int rc;
++
+     if (msg == NULL) {
+         return ERROR;
+     }
+ 
+-    return msg_queue_push(&g_inbound_queue, msg, AGENT_BUS_PUSH_TIMEOUT_MS);
++    syslog(LOG_INFO, "[BUS-DIAG] producer bus=%p\n",
++           (void*)&g_inbound_queue);
++    rc = msg_queue_push(&g_inbound_queue, msg, AGENT_BUS_PUSH_TIMEOUT_MS);
++    return rc;
+ }
+ 
+ int message_bus_pop_inbound(agent_msg_t *msg, uint32_t timeout_ms)
+ {
++    int rc;
++
+     if (msg == NULL) {
+         return ERROR;
+     }
+ 
+-    return msg_queue_pop(&g_inbound_queue, msg, timeout_ms);
++    syslog(LOG_INFO, "[BUS-DIAG] consumer bus=%p\n",
++           (void*)&g_inbound_queue);
++    rc = msg_queue_pop(&g_inbound_queue, msg, timeout_ms);
++    return rc;
+ }
+ 
+ int message_bus_push_outbound(const agent_msg_t *msg)

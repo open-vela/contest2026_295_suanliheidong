@@ -1,0 +1,431 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,6 +68,7 @@
+     src/voice/voice_channel.c
+     src/stubs.c
+     src/ui/qrcode_display.c
++    src/ui/agent_oled.c
+   )
+ 
+   # Optional modules
+--- a/Makefile
++++ b/Makefile
+@@ -159,6 +159,7 @@
+ CSRCS += src/sdk/velaclaw_client_local.c
+ 
+ CSRCS += src/ui/qrcode_display.c
++CSRCS += src/ui/agent_oled.c
+ 
+ ifeq ($(CONFIG_AI_AGENT_LVGL_UI),y)
+ CSRCS += src/lvgl_ui/lvgl_ui_channel.c
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -77,6 +77,7 @@
+ #ifdef CONFIG_AI_AGENT_LVGL_UI
+ #include "ui/lvgl_ui_channel.h"
+ #endif
++#include "ui/agent_oled.h"
+ #ifdef CONFIG_AI_AGENT_BLE_GATT
+ #include "infra/ble_cmd_handler.h"
+ #include "infra/ble_gatt.h"
+@@ -622,6 +623,9 @@
+     }
+     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
+ 
++    if (agent_oled_start() != OK)
++        BOOT_LOG(&t0, "P5", "OLED worker unavailable");
++
+ #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+     /* Quickapp mqueue listener - receives requests from quickapp process */
+     if (agent_task_create(quickapp_mq_listener_task, "qapp_mq",
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -23,6 +23,7 @@
+ #include <inttypes.h>
+ 
+ #include "core/agent_loop.h"
++#include "ui/agent_oled.h"
+ #include "core/agent_mem.h"
+ #include "core/agent_trace.h"
+ #include "core/context_builder.h"
+@@ -852,6 +853,8 @@
+         out.content = final_text;
+         if (message_bus_push_outbound(&out) != OK) {
+             free(final_text);
++        } else {
++            agent_oled_enqueue(final_text);
+         }
+     } else {
+         free(final_text);
+diff --git a/src/ui/agent_oled.h b/src/ui/agent_oled.h
+new file mode 100644
+index 0000000..d6c64eb
+--- /dev/null
++++ b/src/ui/agent_oled.h
+@@ -0,0 +1,21 @@
++/*
++ * AI Agent completed-response OLED output.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef __AI_AGENT_UI_AGENT_OLED_H
++#define __AI_AGENT_UI_AGENT_OLED_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++int agent_oled_start(void);
++void agent_oled_enqueue(const char *content);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __AI_AGENT_UI_AGENT_OLED_H */
+diff --git a/src/ui/agent_oled.c b/src/ui/agent_oled.c
+new file mode 100644
+index 0000000..45be0ab
+--- /dev/null
++++ b/src/ui/agent_oled.c
+@@ -0,0 +1,339 @@
++/*
++ * AI Agent completed-response OLED output.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <nuttx/config.h>
++
++#include <arch/board/board.h>
++#include <nuttx/lcd/lcd.h>
++
++#include "agent_compat.h"
++#include "ui/agent_oled.h"
++
++extern int board_oled_initialize(void) __attribute__((weak));
++extern struct lcd_dev_s *board_oled_getdev(void) __attribute__((weak));
++
++#define AGENT_OLED_QUEUE_DEPTH 4
++#define AGENT_OLED_TEXT_CAPACITY 1024
++#define AGENT_OLED_CHARS_PER_LINE 21
++#define AGENT_OLED_MAX_LINES 64
++#define AGENT_OLED_WIDTH 128
++#define AGENT_OLED_HEIGHT 64
++#define AGENT_OLED_PAGES 8
++#define AGENT_OLED_FONT_WIDTH 5
++#define AGENT_OLED_FONT_STEP 6
++#define AGENT_OLED_STACK 8192
++#define AGENT_OLED_PRIORITY 55
++
++struct agent_oled_slot_s
++{
++  size_t len;
++  char text[AGENT_OLED_TEXT_CAPACITY];
++};
++
++struct agent_oled_queue_s
++{
++  pthread_mutex_t lock;
++  pthread_cond_t available;
++  struct agent_oled_slot_s slots[AGENT_OLED_QUEUE_DEPTH];
++  unsigned int head;
++  unsigned int tail;
++  unsigned int count;
++};
++
++static struct agent_oled_queue_s g_oled_queue =
++{
++  .lock = PTHREAD_MUTEX_INITIALIZER,
++  .available = PTHREAD_COND_INITIALIZER,
++};
++
++static struct lcd_dev_s *g_oled_dev;
++static struct lcd_planeinfo_s g_oled_plane;
++static volatile bool g_oled_started;
++static volatile bool g_oled_disabled;
++static bool g_oled_non_ascii_reported;
++
++/* This is the sparse 5x7 font already used by the contest voice application. */
++static const uint8_t g_font[128][AGENT_OLED_FONT_WIDTH] =
++{
++  [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
++  ['.'] = {0x00, 0x60, 0x60, 0x00, 0x00},
++  [':'] = {0x00, 0x36, 0x36, 0x00, 0x00},
++  ['0'] = {0x3e, 0x51, 0x49, 0x45, 0x3e},
++  ['1'] = {0x00, 0x42, 0x7f, 0x40, 0x00},
++  ['2'] = {0x42, 0x61, 0x51, 0x49, 0x46},
++  ['3'] = {0x21, 0x41, 0x45, 0x4b, 0x31},
++  ['4'] = {0x18, 0x14, 0x12, 0x7f, 0x10},
++  ['5'] = {0x27, 0x45, 0x45, 0x45, 0x39},
++  ['6'] = {0x3c, 0x4a, 0x49, 0x49, 0x30},
++  ['7'] = {0x01, 0x71, 0x09, 0x05, 0x03},
++  ['8'] = {0x36, 0x49, 0x49, 0x49, 0x36},
++  ['9'] = {0x06, 0x49, 0x49, 0x29, 0x1e},
++  ['A'] = {0x7e, 0x11, 0x11, 0x11, 0x7e},
++  ['C'] = {0x3e, 0x41, 0x41, 0x41, 0x22},
++  ['D'] = {0x7f, 0x41, 0x41, 0x22, 0x1c},
++  ['E'] = {0x7f, 0x49, 0x49, 0x49, 0x41},
++  ['G'] = {0x3e, 0x41, 0x49, 0x49, 0x7a},
++  ['I'] = {0x00, 0x41, 0x7f, 0x41, 0x00},
++  ['L'] = {0x7f, 0x40, 0x40, 0x40, 0x40},
++  ['N'] = {0x7f, 0x02, 0x04, 0x08, 0x7f},
++  ['O'] = {0x3e, 0x41, 0x41, 0x41, 0x3e},
++  ['P'] = {0x7f, 0x09, 0x09, 0x09, 0x06},
++  ['R'] = {0x7f, 0x09, 0x19, 0x29, 0x46},
++  ['S'] = {0x46, 0x49, 0x49, 0x49, 0x31},
++  ['V'] = {0x1f, 0x20, 0x40, 0x20, 0x1f},
++  ['Y'] = {0x07, 0x08, 0x70, 0x08, 0x07},
++};
++
++static bool agent_oled_font_supported(unsigned char ch)
++{
++  switch (ch)
++    {
++      case ' ':
++      case '.':
++      case ':':
++      case '0': case '1': case '2': case '3': case '4': case '5':
++      case '6': case '7': case '8': case '9':
++      case 'A': case 'C': case 'D': case 'E': case 'G': case 'I':
++      case 'L': case 'N': case 'O': case 'P': case 'R': case 'S':
++      case 'V': case 'Y':
++        return true;
++      default:
++        return false;
++    }
++}
++
++static void agent_oled_mark_non_ascii(void)
++{
++  if (!g_oled_non_ascii_reported)
++    {
++      g_oled_non_ascii_reported = true;
++      syslog(LOG_INFO, "[OLED-DIAG] non-ascii replaced\n");
++    }
++}
++
++static unsigned int agent_oled_make_lines(const char *text,
++                                           char lines[AGENT_OLED_MAX_LINES]
++                                                [AGENT_OLED_CHARS_PER_LINE + 1])
++{
++  unsigned int line = 0;
++  unsigned int column = 0;
++  size_t pos = 0;
++
++  while (text[pos] != '\0' && line < AGENT_OLED_MAX_LINES)
++    {
++      unsigned char ch = (unsigned char)text[pos++];
++
++      if (ch >= 0x80)
++        {
++          agent_oled_mark_non_ascii();
++          while ((unsigned char)text[pos] >= 0x80 &&
++                 ((unsigned char)text[pos] & 0xc0) != 0xc0)
++            {
++              pos++;
++            }
++          ch = ' ';
++        }
++
++      if (ch == '\r')
++        continue;
++
++      if (ch == '\n' || column == AGENT_OLED_CHARS_PER_LINE)
++        {
++          lines[line][column] = '\0';
++          line++;
++          column = 0;
++          if (line >= AGENT_OLED_MAX_LINES)
++            break;
++          if (ch == '\n')
++            continue;
++        }
++
++      if (ch < ' ' || !agent_oled_font_supported(ch))
++        ch = ' ';
++      lines[line][column++] = (char)ch;
++    }
++
++  if (line < AGENT_OLED_MAX_LINES)
++    {
++      lines[line][column] = '\0';
++      line++;
++    }
++
++  return line == 0 ? 1 : line;
++}
++
++static void agent_oled_set_pixel(uint8_t row[AGENT_OLED_WIDTH / 8],
++                                 unsigned int x)
++{
++#ifdef CONFIG_LCD_PACKEDMSFIRST
++  row[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
++#else
++  row[x >> 3] |= (uint8_t)(1 << (x & 7));
++#endif
++}
++
++static bool agent_oled_render_window(
++    char lines[AGENT_OLED_MAX_LINES][AGENT_OLED_CHARS_PER_LINE + 1],
++    unsigned int line_count, unsigned int first)
++{
++  uint8_t frame[AGENT_OLED_HEIGHT][AGENT_OLED_WIDTH / 8];
++  unsigned int page;
++  unsigned int y;
++
++  memset(frame, 0, sizeof(frame));
++  for (page = 0; page < AGENT_OLED_PAGES; page++)
++    {
++      unsigned int line = first + page;
++      unsigned int column;
++      unsigned int glyph_row;
++
++      if (line >= line_count)
++        break;
++
++      for (column = 0; lines[line][column] != '\0'; column++)
++        {
++          unsigned char glyph = (unsigned char)lines[line][column];
++          unsigned int glyph_col;
++
++          for (glyph_col = 0; glyph_col < AGENT_OLED_FONT_WIDTH;
++               glyph_col++)
++            {
++              for (glyph_row = 0; glyph_row < 7; glyph_row++)
++                {
++                  if ((g_font[glyph][glyph_col] & (1u << glyph_row)) != 0)
++                    {
++                      agent_oled_set_pixel(frame[page * 8 + glyph_row],
++                                           column * AGENT_OLED_FONT_STEP +
++                                           glyph_col);
++                    }
++                }
++            }
++        }
++    }
++
++  for (page = 0; page < AGENT_OLED_PAGES; page++)
++    {
++      syslog(LOG_INFO, "[OLED-DIAG] render page=%u\n", page);
++      for (y = page * 8; y < (page + 1) * 8; y++)
++        {
++          if (g_oled_plane.putrun(g_oled_dev, y, 0, frame[y],
++                                  AGENT_OLED_WIDTH) < 0)
++            {
++              return false;
++            }
++        }
++    }
++
++  return true;
++}
++
++static void *agent_oled_task(void *arg)
++{
++  (void)arg;
++
++  if (board_oled_initialize == NULL || board_oled_getdev == NULL ||
++      board_oled_initialize() < 0)
++    {
++      g_oled_disabled = true;
++      return NULL;
++    }
++
++  g_oled_dev = board_oled_getdev();
++  if (g_oled_dev == NULL || g_oled_dev->getplaneinfo(g_oled_dev, 0,
++                                                      &g_oled_plane) < 0)
++    {
++      g_oled_disabled = true;
++      return NULL;
++    }
++
++  while (!agent_shutdown_requested())
++    {
++      char text[AGENT_OLED_TEXT_CAPACITY];
++      char lines[AGENT_OLED_MAX_LINES][AGENT_OLED_CHARS_PER_LINE + 1];
++      unsigned int line_count;
++      unsigned int first;
++
++      pthread_mutex_lock(&g_oled_queue.lock);
++      while (g_oled_queue.count == 0 && !agent_shutdown_requested())
++        pthread_cond_wait(&g_oled_queue.available, &g_oled_queue.lock);
++      if (g_oled_queue.count == 0)
++        {
++          pthread_mutex_unlock(&g_oled_queue.lock);
++          continue;
++        }
++
++      memcpy(text, g_oled_queue.slots[g_oled_queue.head].text,
++             g_oled_queue.slots[g_oled_queue.head].len + 1);
++      g_oled_queue.head = (g_oled_queue.head + 1) % AGENT_OLED_QUEUE_DEPTH;
++      g_oled_queue.count--;
++      pthread_mutex_unlock(&g_oled_queue.lock);
++
++      line_count = agent_oled_make_lines(text, lines);
++      for (first = 0; first < line_count && !g_oled_disabled; first += 1)
++        {
++          if (!agent_oled_render_window(lines, line_count, first))
++            {
++              g_oled_disabled = true;
++              break;
++            }
++          if (first + AGENT_OLED_PAGES < line_count)
++            usleep(250000);
++        }
++    }
++
++  return NULL;
++}
++
++int agent_oled_start(void)
++{
++  if (g_oled_started)
++    return OK;
++
++  g_oled_started = true;
++  if (agent_task_create(agent_oled_task, "agent_oled", AGENT_OLED_STACK,
++                        NULL, AGENT_OLED_PRIORITY) != OK)
++    {
++      g_oled_disabled = true;
++      return ERROR;
++    }
++
++  return OK;
++}
++
++void agent_oled_enqueue(const char *content)
++{
++  struct agent_oled_slot_s *slot;
++  size_t len;
++
++  if (content == NULL || !g_oled_started || g_oled_disabled)
++    return;
++
++  len = strnlen(content, AGENT_OLED_TEXT_CAPACITY - 1);
++  pthread_mutex_lock(&g_oled_queue.lock);
++
++  if (g_oled_disabled)
++    {
++      pthread_mutex_unlock(&g_oled_queue.lock);
++      return;
++    }
++
++  if (g_oled_queue.count == AGENT_OLED_QUEUE_DEPTH)
++    {
++      g_oled_queue.head = (g_oled_queue.head + 1) % AGENT_OLED_QUEUE_DEPTH;
++      g_oled_queue.count--;
++    }
++
++  slot = &g_oled_queue.slots[g_oled_queue.tail];
++  memcpy(slot->text, content, len);
++  slot->text[len] = '\0';
++  slot->len = len;
++  g_oled_queue.tail = (g_oled_queue.tail + 1) % AGENT_OLED_QUEUE_DEPTH;
++  g_oled_queue.count++;
++  pthread_cond_signal(&g_oled_queue.available);
++  pthread_mutex_unlock(&g_oled_queue.lock);
++
++  syslog(LOG_INFO, "[OLED-DIAG] enqueue len=%zu\n", len);
++}

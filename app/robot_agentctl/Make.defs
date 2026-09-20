@@ -1,0 +1,7 @@
+############################################################################
+# Contest-local proactive runtime diagnostic command
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_295_ROBOT_AGENTCTL),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_295_robot_agentctl
+endif

@@ -1,0 +1,61 @@
+diff --git a/arch/xtensa/src/common/xtensa_assert.c b/arch/xtensa/src/common/xtensa_assert.c
+index ad78766..82d0fc2 100644
+--- a/arch/xtensa/src/common/xtensa_assert.c
++++ b/arch/xtensa/src/common/xtensa_assert.c
+@@ -67,6 +67,28 @@ void xtensa_panic(int xptcode, uint32_t *regs)
+ {
+   struct tcb_s *tcb = g_running_task;
+ 
++  /* Capture the exception frame before _assert() replaces it with the
++   * panic-context snapshot. */
++  if (regs != NULL)
++    {
++      _alert("[RAW-PANIC] XPT=%d PC=%08lx PS=%08lx EXCCAUSE=%08lx "
++             "EXCVADDR=%08lx A0=%08lx A1=%08lx A2=%08lx A3=%08lx "
++             "A4=%08lx A5=%08lx A6=%08lx A7=%08lx\n",
++             xptcode,
++             (unsigned long)regs[REG_PC],
++             (unsigned long)regs[REG_PS],
++             (unsigned long)regs[REG_EXCCAUSE],
++             (unsigned long)regs[REG_EXCVADDR],
++             (unsigned long)regs[REG_A0],
++             (unsigned long)regs[REG_A1],
++             (unsigned long)regs[REG_A2],
++             (unsigned long)regs[REG_A3],
++             (unsigned long)regs[REG_A4],
++             (unsigned long)regs[REG_A5],
++             (unsigned long)regs[REG_A6],
++             (unsigned long)regs[REG_A7]);
++    }
++
+   if (tcb != NULL)
+     {
+       tcb->xcp.regs = regs;
+@@ -173,6 +195,27 @@ void xtensa_user_panic(int exccause, uint32_t *regs)
+ {
+   struct tcb_s *tcb = g_running_task;
+ 
++  /* Capture the exception frame before _assert() replaces it with the
++   * panic-context snapshot. */
++  if (regs != NULL)
++    {
++      _alert("[RAW-EXC] PC=%08lx PS=%08lx EXCCAUSE=%08lx EXCVADDR=%08lx "
++             "A0=%08lx A1=%08lx A2=%08lx A3=%08lx A4=%08lx A5=%08lx "
++             "A6=%08lx A7=%08lx\n",
++             (unsigned long)regs[REG_PC],
++             (unsigned long)regs[REG_PS],
++             (unsigned long)regs[REG_EXCCAUSE],
++             (unsigned long)regs[REG_EXCVADDR],
++             (unsigned long)regs[REG_A0],
++             (unsigned long)regs[REG_A1],
++             (unsigned long)regs[REG_A2],
++             (unsigned long)regs[REG_A3],
++             (unsigned long)regs[REG_A4],
++             (unsigned long)regs[REG_A5],
++             (unsigned long)regs[REG_A6],
++             (unsigned long)regs[REG_A7]);
++    }
++
+   if (tcb != NULL)
+     {
+       tcb->xcp.regs = regs;

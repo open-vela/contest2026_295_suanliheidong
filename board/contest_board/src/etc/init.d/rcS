@@ -1,0 +1,16 @@
+/****************************************************************************
+ * board/contest_board/src/etc/init.d/rcS
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
+
+#include <nuttx/config.h>
+
+set +e
+
+/*
+ * Keep the media daemon out of the early boot path.  The contest audio
+ * device is registered during board bring-up, but mediad owns long-lived
+ * poll/event loops and must be started only after the base system is stable.
+ * Start it explicitly from NSH with `mediad &` when media playback is used.
+ */

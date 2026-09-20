@@ -1,0 +1,15 @@
+diff --git a/src/llm/llm_parse.c b/src/llm/llm_parse.c
+--- a/src/llm/llm_parse.c
++++ b/src/llm/llm_parse.c
+@@ -688,7 +688,11 @@ cJSON* build_openai_tools_array(const char* tools_json)
+     if (!agent_heap_gate_tools_parsed()) {
+         return NULL;
+     }
+ 
++    syslog(LOG_INFO,
++        "[ALLOC-DIAG] tools_array before heap=%p size=%zu ra=%p\\n",
++        (void *)USR_HEAP, sizeof(cJSON), __builtin_return_address(0));
++
+     cJSON* tools_arr = cJSON_CreateArray();
+     cJSON* tool_def;
+ 
