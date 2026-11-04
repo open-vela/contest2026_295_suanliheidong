@@ -1,3 +1,4 @@
+#include "robot_voice_diag.h"
 #include <nuttx/config.h>
 
 #include <errno.h>
@@ -18,6 +19,7 @@ int mimo_llm_chat(const char *api_key, const char *prompt, char *reply,
   cJSON *message = cJSON_CreateObject();
   char *body = NULL;
   char *response = NULL;
+  char *prepared = NULL;
   size_t response_len = 0;
   cJSON *choices; cJSON *first; cJSON *msg; cJSON *answer;
   int ret;
@@ -33,7 +35,10 @@ int mimo_llm_chat(const char *api_key, const char *prompt, char *reply,
   body = cJSON_PrintUnformatted(root); cJSON_Delete(root); root = NULL;
   response = malloc(ROBOT_VOICE_HTTP_RESPONSE);
   if (!body || !response) { free(body); free(response); return -ENOMEM; }
-  printf("[RV-LLM] request begin bytes=%zu\n", strlen(body));
+  ret = robot_mimo_prepare_llm_body(body, &prepared);
+  if (ret < 0) { free(body); free(response); return ret; }
+  if (prepared) { free(body); body = prepared; }
+  RV_VERBOSE("[RV-LLM] request begin bytes=%zu\n", strlen(body));
   ret = robot_mimo_post(api_key, body, strlen(body), response,
                         ROBOT_VOICE_HTTP_RESPONSE, &response_len);
   free(body);
@@ -44,7 +49,9 @@ int mimo_llm_chat(const char *api_key, const char *prompt, char *reply,
   msg = first ? cJSON_GetObjectItem(first, "message") : NULL;
   answer = msg ? cJSON_GetObjectItem(msg, "content") : NULL;
   if (!cJSON_IsString(answer) || !answer->valuestring) { cJSON_Delete(root); return -EPROTO; }
-  strncpy(reply, answer->valuestring, reply_cap - 1); reply[reply_cap - 1] = '\0';
-  printf("[RV-LLM] response bytes=%zu reply=%zu\n", response_len, strlen(reply));
+  if (strlen(answer->valuestring) >= reply_cap)
+    { cJSON_Delete(root); return -EOVERFLOW; }
+  memcpy(reply, answer->valuestring, strlen(answer->valuestring) + 1);
+  RV_VERBOSE("[RV-LLM] response bytes=%zu reply=%zu\n", response_len, strlen(reply));
   cJSON_Delete(root); return 0;
 }

@@ -1,0 +1,1318 @@
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_wlan.c b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+index d7c0578d0b8..ad35da09ebd 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_wlan.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+@@ -27,9 +27,11 @@
+ #ifdef CONFIG_ESP32S3_WIFI
+ 
+ #include <assert.h>
++#include <inttypes.h>
+ #include <errno.h>
+ #include <debug.h>
+ #include <arpa/inet.h>
++#include <syslog.h>
+ 
+ #include <nuttx/crc64.h>
+ #include <nuttx/nuttx.h>
+@@ -81,6 +83,322 @@
+ 
+ #define WLAN_PKTBUF_NUM           (CONFIG_ESP32S3_WLAN_PKTBUF_NUM)
+ 
++/*
++ * RX reserve for the shared WLAN packet-buffer pool.
++ *
++ * RX and TX currently share pktbuf[].  During a large TCP write, devif_poll()
++ * may enqueue many TX frames before wlan_transmit() gets a chance to drain
++ * txb.  With CONFIG_ESP32S3_WLAN_PKTBUF_NUM=16 this can consume the entire
++ * pool and make wlan_rx_done() fail with -ENOBUFS, dropping TCP ACKs and
++ * eventually resetting the TLS connection.
++ *
++ * Keep half of the pool unavailable to normal TX polling.  RX still uses the
++ * full pool, so receive bursts can consume the reserve when needed.
++ */
++#define WLAN_RX_RESERVED_BUFS \
++  ((WLAN_PKTBUF_NUM >= 8) ? (WLAN_PKTBUF_NUM / 2) : 2)
++
++/*
++ * Upper-layer Wi-Fi TX flow control.
++ *
++ * esp_wifi_internal_tx() uses the vendor driver's dynamic TX resources.
++ * Submitting an entire NuttX txb burst in one wlan_transmit() call can
++ * exhaust those resources and return -ENOMEM, even for small TCP ACKs.
++ *
++ * Keep only a small number of vendor TX submissions in flight.  TX-done
++ * callbacks return credits and immediately schedule more work.
++ */
++#define WLAN_WIFI_TX_INFLIGHT_MAX 4
++
++/* Vendor ESP_ERR_NO_MEM is temporary backpressure, not a reason to spin.
++ * Retry the same queued packet with bounded exponential backoff.
++ */
++
++#define WLAN_TX_RETRY_MIN_MS       10
++#define WLAN_TX_RETRY_MAX_MS       160
++#define WLAN_TX_RETRY_MAX_ATTEMPTS 8
++
++
++
++/*
++ * HTTPS/TLS receive-path diagnostics.
++ *
++ * The contest configuration currently uses CONFIG_NET_ETH_PKTSIZE=590.
++ * Log only TCP/443 traffic, with a strict rate limit, so we can determine:
++ *   - the MSS advertised in SYN/SYN-ACK;
++ *   - whether MiMo's first TLS response reaches the Wi-Fi callback;
++ *   - whether an incoming Ethernet frame exceeds WLAN_BUF_SIZE;
++ *   - whether the small wlan_pktbuf pool is exhausted.
++ *
++ * This code does not modify packets.
++ */
++#define WLAN_TLS_DIAG_PORT          443
++#define WLAN_TLS_DIAG_PAYLOAD_LIMIT 32 /* retained for source compatibility */
++
++static uint32_t g_wlan_tls_diag_frames;
++static uint32_t g_wlan_tls_rx_oversize;
++static uint32_t g_wlan_tls_rx_nobuf;
++static uint32_t g_wlan_tls_rx_work_requeue;
++static uint32_t g_wlan_tls_txdone_ok;
++static uint32_t g_wlan_tls_txdone_fail;
++
++static uint16_t wlan_diag_be16(const uint8_t *p)
++{
++  return ((uint16_t)p[0] << 8) | p[1];
++}
++
++
++static uint32_t wlan_diag_be32(const uint8_t *p)
++{
++  return ((uint32_t)p[0] << 24) |
++         ((uint32_t)p[1] << 16) |
++         ((uint32_t)p[2] << 8) |
++         (uint32_t)p[3];
++}
++
++
++static uint32_t wlan_diag_csum_add(uint32_t sum,
++                                   const uint8_t *data, size_t len)
++{
++  while (len >= 2)
++    {
++      sum += ((uint16_t)data[0] << 8) | data[1];
++      data += 2;
++      len -= 2;
++    }
++
++  if (len != 0)
++    {
++      sum += (uint16_t)data[0] << 8;
++    }
++
++  return sum;
++}
++
++static uint16_t wlan_diag_csum_fold(uint32_t sum)
++{
++  while ((sum >> 16) != 0)
++    {
++      sum = (sum & 0xffff) + (sum >> 16);
++    }
++
++  return (uint16_t)sum;
++}
++
++static bool wlan_diag_ipv4_checksum_ok(const uint8_t *ip, size_t ihl)
++{
++  uint32_t sum;
++
++  if (!ip || ihl < 20)
++    {
++      return false;
++    }
++
++  sum = wlan_diag_csum_add(0, ip, ihl);
++  return wlan_diag_csum_fold(sum) == 0xffff;
++}
++
++static bool wlan_diag_tcp_checksum_ok(const uint8_t *ip,
++                                      size_t ihl,
++                                      const uint8_t *tcp,
++                                      size_t tcp_len)
++{
++  uint32_t sum = 0;
++
++  if (!ip || !tcp || ihl < 20 || tcp_len < 20)
++    {
++      return false;
++    }
++
++  /* IPv4 pseudo-header: source, destination, zero, protocol, TCP length. */
++
++  sum = wlan_diag_csum_add(sum, ip + 12, 8);
++  sum += ip[9];
++  sum += (uint16_t)tcp_len;
++  sum = wlan_diag_csum_add(sum, tcp, tcp_len);
++
++  return wlan_diag_csum_fold(sum) == 0xffff;
++}
++
++static bool wlan_diag_is_tcp443(const void *buffer, size_t len)
++{
++  const uint8_t *frame = (const uint8_t *)buffer;
++  size_t ipoff = 14;
++  size_t ihl;
++  size_t tcpoff;
++  uint16_t src;
++  uint16_t dst;
++
++  if (!frame || len < 14 + 20)
++    {
++      return false;
++    }
++
++  if (frame[12] != 0x08 || frame[13] != 0x00)
++    {
++      return false;
++    }
++
++  ihl = (size_t)(frame[ipoff] & 0x0f) * 4;
++  if (ihl < 20 || len < ipoff + ihl + 20 || frame[ipoff + 9] != 6)
++    {
++      return false;
++    }
++
++  tcpoff = ipoff + ihl;
++  src = wlan_diag_be16(frame + tcpoff);
++  dst = wlan_diag_be16(frame + tcpoff + 2);
++
++  return src == WLAN_TLS_DIAG_PORT || dst == WLAN_TLS_DIAG_PORT;
++}
++
++static int wlan_diag_tcp_mss(const uint8_t *tcp, size_t tcp_hlen)
++{
++  size_t off = 20;
++
++  if (tcp_hlen <= 20)
++    {
++      return -1;
++    }
++
++  while (off < tcp_hlen)
++    {
++      uint8_t kind = tcp[off];
++
++      if (kind == 0)
++        {
++          break;
++        }
++
++      if (kind == 1)
++        {
++          off++;
++          continue;
++        }
++
++      if (off + 1 >= tcp_hlen)
++        {
++          break;
++        }
++
++      uint8_t optlen = tcp[off + 1];
++      if (optlen < 2 || off + optlen > tcp_hlen)
++        {
++          break;
++        }
++
++      if (kind == 2 && optlen == 4)
++        {
++          return (int)wlan_diag_be16(tcp + off + 2);
++        }
++
++      off += optlen;
++    }
++
++  return -1;
++}
++
++static void wlan_diag_tls_frame(const char *dir, const void *buffer, size_t len)
++{
++  const uint8_t *frame = (const uint8_t *)buffer;
++  size_t ipoff = 14;
++  size_t ihl;
++  size_t tcpoff;
++  size_t tcp_hlen;
++  uint16_t src;
++  uint16_t dst;
++  uint16_t ip_total;
++  uint8_t flags;
++  size_t payload;
++  int mss = -1;
++  uint32_t seq;
++  uint32_t ackno;
++  uint16_t wnd;
++  size_t tcp_len;
++  bool ip_csum_ok;
++  bool tcp_csum_ok;
++  bool control;
++
++  if (!frame || len < 14 + 20)
++    {
++      return;
++    }
++
++  /* Ethernet IPv4 only. */
++  if (frame[12] != 0x08 || frame[13] != 0x00)
++    {
++      return;
++    }
++
++  ihl = (size_t)(frame[ipoff] & 0x0f) * 4;
++  if (ihl < 20 || len < ipoff + ihl || frame[ipoff + 9] != 6)
++    {
++      return;
++    }
++
++  tcpoff = ipoff + ihl;
++  if (len < tcpoff + 20)
++    {
++      return;
++    }
++
++  src = wlan_diag_be16(frame + tcpoff);
++  dst = wlan_diag_be16(frame + tcpoff + 2);
++  if (src != WLAN_TLS_DIAG_PORT && dst != WLAN_TLS_DIAG_PORT)
++    {
++      return;
++    }
++
++  ip_total = wlan_diag_be16(frame + ipoff + 2);
++  tcp_hlen = (size_t)(frame[tcpoff + 12] >> 4) * 4;
++  if (tcp_hlen < 20 || len < tcpoff + tcp_hlen)
++    {
++      return;
++    }
++
++  flags = frame[tcpoff + 13];
++  payload = ip_total >= ihl + tcp_hlen ?
++            (size_t)ip_total - ihl - tcp_hlen : 0;
++  control = (flags & (0x02 | 0x01 | 0x04)) != 0; /* SYN/FIN/RST */
++  seq = wlan_diag_be32(frame + tcpoff + 4);
++  ackno = wlan_diag_be32(frame + tcpoff + 8);
++  wnd = wlan_diag_be16(frame + tcpoff + 14);
++  tcp_len = ip_total >= ihl ? (size_t)ip_total - ihl : 0;
++  ip_csum_ok = wlan_diag_ipv4_checksum_ok(frame + ipoff, ihl);
++  tcp_csum_ok = wlan_diag_tcp_checksum_ok(frame + ipoff, ihl,
++                                          frame + tcpoff, tcp_len);
++
++  if ((flags & 0x02) != 0)
++    {
++      mss = wlan_diag_tcp_mss(frame + tcpoff, tcp_hlen);
++    }
++
++  /*
++   * For this run, keep pure ACKs too.  They tell us whether the peer ACKed
++   * the 149-byte ClientHello even when it sends no TLS response record.
++   * A single global limit prevents the diagnostic from flooding the console.
++   */
++  if (!control && g_wlan_tls_diag_frames >= 80)
++    {
++      return;
++    }
++
++  g_wlan_tls_diag_frames++;
++
++  syslog(LOG_INFO,
++         "[WLAN-TLS] %s frame=%zu max=%u ip_total=%u "
++         "tcp_hlen=%zu payload=%zu flags=0x%02x "
++         "src=%u dst=%u seq=%" PRIu32 " ack=%" PRIu32
++         " wnd=%u mss=%d ipcsum=%s tcpcsum=%s\n",
++         dir ? dir : "?",
++         len, (unsigned int)WLAN_BUF_SIZE, (unsigned int)ip_total,
++         tcp_hlen, payload, flags,
++         (unsigned int)src, (unsigned int)dst,
++         seq, ackno, (unsigned int)wnd, mss,
++         ip_csum_ok ? "OK" : "BAD",
++         tcp_csum_ok ? "OK" : "BAD");
++}
++
+ /* Receive threshold which allows the receive function to trigger a scheduler
+  * to activate the application if possible.
+  */
+@@ -142,10 +460,12 @@ struct wlan_priv_s
+   bool   ifup;                  /* true:ifup false:ifdown */
+ 
+   struct wdog_s txtimeout;      /* TX timeout timer */
++  struct wdog_s retrytimer;     /* Short vendor-ENOMEM backoff timer */
++  struct wdog_s rxretrytimer;   /* Retry RX work after queue failure */
+ 
+   struct work_s rxwork;         /* Send packet work */
+   struct work_s txwork;         /* Receive packet work */
+-  struct work_s pollwork;       /* Poll work */
++  struct work_s retrywork;      /* Retry work after vendor -ENOMEM */
+   struct work_s toutwork;       /* Send packet timeout work */
+ 
+   const struct wlan_ops *ops;   /* WLAN operations */
+@@ -170,6 +490,40 @@ struct wlan_priv_s
+ 
+   sq_queue_t    freeb;
+ 
++  /*
++   * Number of entries currently in freeb.  Protected by lock.
++   * TX polling observes this count so it cannot consume the RX reserve.
++   */
++
++  uint16_t      free_count;
++
++  /*
++   * Number of frames successfully reserved for submission to the vendor
++   * Wi-Fi TX path and not yet completed by the TX-done callback.
++   * Protected by lock.
++   */
++
++  uint16_t      tx_inflight;
++
++  /* Vendor TX ENOMEM backoff state. Protected by lock. */
++
++  uint16_t      tx_retry_ms;
++  bool          tx_retry_pending;
++  /* RX work queued or currently running */
++  bool          rx_work_pending;
++  uint32_t      tx_retry_count;
++
++  /* RX ownership and scheduling diagnostics.  Protected by lock. */
++
++  uint16_t      rxb_count;
++  uint16_t      rxb_highwater;
++  uint16_t      free_min;
++  uint32_t      rx_enqueued;
++  uint32_t      rx_dequeued;
++  uint32_t      buf_recycled;
++  uint32_t      rx_work_scheduled;
++  uint32_t      rx_work_failed;
++
+   /* Device specific lock */
+ 
+   spinlock_t    lock;
+@@ -240,6 +594,15 @@ static const struct wlan_ops g_softap_ops =
+ static struct wlan_pktbuf *wlan_recvframe(struct wlan_priv_s *priv);
+ static struct wlan_pktbuf *wlan_txframe(struct wlan_priv_s *priv);
+ static void wlan_transmit(struct wlan_priv_s *priv);
++static bool wlan_tx_retry_is_pending(struct wlan_priv_s *priv);
++static void wlan_tx_retry_reset(struct wlan_priv_s *priv);
++static void wlan_txretry_work(void *arg);
++static void wlan_txretry_expiry(wdparm_t arg);
++static void wlan_tx_retry_schedule(struct wlan_priv_s *priv);
++static void wlan_rxwork_retry_expiry(wdparm_t arg);
++static void wlan_rxwork_schedule_retry(struct wlan_priv_s *priv);
++static void wlan_rx_stats_report(struct wlan_priv_s *priv,
++                                 const char *reason);
+ static void wlan_rxpoll(void *arg);
+ static int  wlan_txpoll(struct net_driver_s *dev);
+ static void wlan_dopoll(struct wlan_priv_s *priv);
+@@ -307,16 +670,42 @@ static inline void wlan_init_buffer(struct wlan_priv_s *priv)
+ 
+   priv->dev.d_buf = NULL;
+   priv->dev.d_len = 0;
++  priv->rx_work_pending = false;
+ 
+   sq_init(&priv->freeb);
+   sq_init(&priv->rxb);
+   sq_init(&priv->txb);
++  priv->free_count = 0;
++  priv->tx_inflight = 0;
++  priv->tx_retry_ms = WLAN_TX_RETRY_MIN_MS;
++  priv->tx_retry_pending = false;
++  priv->tx_retry_count = 0;
++  priv->rxb_count = 0;
++  priv->rxb_highwater = 0;
++  priv->free_min = WLAN_PKTBUF_NUM;
++  priv->rx_enqueued = 0;
++  priv->rx_dequeued = 0;
++  priv->buf_recycled = 0;
++  priv->rx_work_scheduled = 0;
++  priv->rx_work_failed = 0;
+ 
+   for (i = 0; i < WLAN_PKTBUF_NUM; i++)
+     {
+       sq_addlast(&priv->pktbuf[i].entry, &priv->freeb);
++      priv->free_count++;
+     }
+ 
++  syslog(LOG_INFO,
++         "[WLAN-BUF] init total=%u rx_reserve=%u free=%u "
++         "tx_inflight_max=%u retry_ms=%u..%u retry_max=%u\n",
++         (unsigned int)WLAN_PKTBUF_NUM,
++         (unsigned int)WLAN_RX_RESERVED_BUFS,
++         (unsigned int)priv->free_count,
++         (unsigned int)WLAN_WIFI_TX_INFLIGHT_MAX,
++         (unsigned int)WLAN_TX_RETRY_MIN_MS,
++         (unsigned int)WLAN_TX_RETRY_MAX_MS,
++         (unsigned int)WLAN_TX_RETRY_MAX_ATTEMPTS);
++
+   spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+@@ -345,6 +734,12 @@ static inline struct wlan_pktbuf *wlan_alloc_buffer(struct wlan_priv_s *priv)
+   if (entry)
+     {
+       pktbuf = container_of(entry, struct wlan_pktbuf, entry);
++      DEBUGASSERT(priv->free_count > 0);
++      priv->free_count--;
++      if (priv->free_count < priv->free_min)
++        {
++          priv->free_min = priv->free_count;
++        }
+     }
+ 
+   spin_unlock_irqrestore(&priv->lock, flags);
+@@ -352,6 +747,268 @@ static inline struct wlan_pktbuf *wlan_alloc_buffer(struct wlan_priv_s *priv)
+   return pktbuf;
+ }
+ 
++
++/****************************************************************************
++ * Function: wlan_alloc_tx_buffer
++ *
++ * Description:
++ *   Allocate a buffer for normal TX polling while preserving a receive-side
++ *   reserve.  This prevents a large TCP write from consuming every shared
++ *   packet buffer before inbound ACKs can be queued.
++ ****************************************************************************/
++
++static inline struct wlan_pktbuf *
++wlan_alloc_tx_buffer(struct wlan_priv_s *priv)
++{
++  static uint32_t reserve_hits;
++  struct wlan_pktbuf *pktbuf = NULL;
++  sq_entry_t *entry;
++  irqstate_t flags;
++
++  flags = spin_lock_irqsave(&priv->lock);
++
++  if (priv->free_count > WLAN_RX_RESERVED_BUFS)
++    {
++      entry = sq_remfirst(&priv->freeb);
++      if (entry)
++        {
++          pktbuf = container_of(entry, struct wlan_pktbuf, entry);
++          DEBUGASSERT(priv->free_count > 0);
++          priv->free_count--;
++          if (priv->free_count < priv->free_min)
++            {
++              priv->free_min = priv->free_count;
++            }
++        }
++    }
++  else
++    {
++      reserve_hits++;
++
++      /* Keep diagnostics useful without flooding the serial console. */
++
++      if (reserve_hits <= 8 || (reserve_hits & 0x1f) == 0)
++        {
++          syslog(LOG_INFO,
++                 "[WLAN-BUF] TX reserve hit=%" PRIu32
++                 " free=%u reserve=%u total=%u\n",
++                 reserve_hits,
++                 (unsigned int)priv->free_count,
++                 (unsigned int)WLAN_RX_RESERVED_BUFS,
++                 (unsigned int)WLAN_PKTBUF_NUM);
++        }
++    }
++
++  spin_unlock_irqrestore(&priv->lock, flags);
++  return pktbuf;
++}
++
++
++/****************************************************************************
++ * Function: wlan_tx_credit_take
++ *
++ * Description:
++ *   Reserve one vendor Wi-Fi TX in-flight slot.
++ ****************************************************************************/
++
++static bool wlan_tx_credit_take(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++  bool ok = false;
++
++  flags = spin_lock_irqsave(&priv->lock);
++
++  if (priv->tx_inflight < WLAN_WIFI_TX_INFLIGHT_MAX)
++    {
++      priv->tx_inflight++;
++      ok = true;
++    }
++
++  spin_unlock_irqrestore(&priv->lock, flags);
++  return ok;
++}
++
++/****************************************************************************
++ * Function: wlan_tx_credit_release
++ *
++ * Description:
++ *   Release one vendor Wi-Fi TX in-flight slot.  The guard makes this robust
++ *   if a vendor callback is observed for a frame that was not counted by the
++ *   upper-half.
++ ****************************************************************************/
++
++static uint16_t wlan_tx_credit_release(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++  uint16_t value;
++
++  flags = spin_lock_irqsave(&priv->lock);
++
++  if (priv->tx_inflight > 0)
++    {
++      priv->tx_inflight--;
++    }
++
++  value = priv->tx_inflight;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  return value;
++}
++
++static uint16_t wlan_tx_credit_count(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++  uint16_t value;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  value = priv->tx_inflight;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  return value;
++}
++
++
++static bool wlan_tx_retry_is_pending(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++  bool pending;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  pending = priv->tx_retry_pending;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  return pending;
++}
++
++static void wlan_tx_retry_reset(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  priv->tx_retry_ms = WLAN_TX_RETRY_MIN_MS;
++  priv->tx_retry_count = 0;
++  spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static uint32_t wlan_tx_retry_count(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++  uint32_t count;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  count = priv->tx_retry_count;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  return count;
++}
++
++static void wlan_txretry_work(void *arg)
++{
++  struct wlan_priv_s *priv = (struct wlan_priv_s *)arg;
++  irqstate_t flags;
++  uint32_t retry_count;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  priv->tx_retry_pending = false;
++  retry_count = priv->tx_retry_count;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  if (!priv->ifup)
++    {
++      return;
++    }
++
++  syslog(LOG_INFO,
++         "[WLAN-TXFLOW] retry fire=%" PRIu32 " free=%u inflight=%u\n",
++         retry_count,
++         (unsigned int)priv->free_count,
++         (unsigned int)wlan_tx_credit_count(priv));
++
++  wlan_transmit(priv);
++
++  if (!wlan_tx_retry_is_pending(priv))
++    {
++      wlan_txavail(&priv->dev);
++    }
++}
++
++static void wlan_txretry_expiry(wdparm_t arg)
++{
++  struct wlan_priv_s *priv = (struct wlan_priv_s *)arg;
++
++  if (work_available(&priv->retrywork))
++    {
++      work_queue(WLAN_WORK, &priv->retrywork, wlan_txretry_work, priv, 0);
++    }
++  else
++    {
++      /* Previous retry work is still unwinding. Try again next tick. */
++
++      wd_start(&priv->retrytimer, 1, wlan_txretry_expiry, (wdparm_t)priv);
++    }
++}
++
++static void wlan_tx_retry_schedule(struct wlan_priv_s *priv)
++{
++  irqstate_t flags;
++  uint16_t delay_ms = 0;
++  uint32_t retry_count = 0;
++  uint32_t delay_ticks;
++  bool schedule = false;
++  int ret;
++
++  flags = spin_lock_irqsave(&priv->lock);
++
++  if (!priv->tx_retry_pending)
++    {
++      delay_ms = priv->tx_retry_ms;
++      priv->tx_retry_pending = true;
++      priv->tx_retry_count++;
++      retry_count = priv->tx_retry_count;
++
++      if (priv->tx_retry_ms < WLAN_TX_RETRY_MAX_MS)
++        {
++          uint32_t next = (uint32_t)priv->tx_retry_ms * 2;
++
++          priv->tx_retry_ms =
++            next > WLAN_TX_RETRY_MAX_MS ? WLAN_TX_RETRY_MAX_MS :
++                                          (uint16_t)next;
++        }
++
++      schedule = true;
++    }
++
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  if (!schedule)
++    {
++      return;
++    }
++
++  delay_ticks = ((uint32_t)delay_ms * CLK_TCK + 999) / 1000;
++  if (delay_ticks == 0)
++    {
++      delay_ticks = 1;
++    }
++
++  syslog(LOG_INFO,
++         "[WLAN-TXFLOW] retry schedule=%" PRIu32
++         " delay=%ums ticks=%" PRIu32 "\n",
++         retry_count, (unsigned int)delay_ms, delay_ticks);
++
++  ret = wd_start(&priv->retrytimer, delay_ticks, wlan_txretry_expiry,
++                 (wdparm_t)priv);
++  if (ret < 0)
++    {
++      flags = spin_lock_irqsave(&priv->lock);
++      priv->tx_retry_pending = false;
++      spin_unlock_irqrestore(&priv->lock, flags);
++
++      syslog(LOG_ERR,
++             "[WLAN-TXFLOW] retry timer failed ret=%d\n", ret);
++    }
++}
++
+ /****************************************************************************
+  * Function: wlan_free_buffer
+  *
+@@ -376,8 +1033,148 @@ static inline void wlan_free_buffer(struct wlan_priv_s *priv,
+ 
+   pktbuf = container_of(buffer, struct wlan_pktbuf, buffer);
+   sq_addlast(&pktbuf->entry, &priv->freeb);
++  DEBUGASSERT(priv->free_count < WLAN_PKTBUF_NUM);
++  priv->free_count++;
++  priv->buf_recycled++;
++
++  spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static void wlan_recycle_queues_locked(struct wlan_priv_s *priv)
++{
++  sq_entry_t *entry;
++
++  while ((entry = sq_remfirst(&priv->rxb)) != NULL)
++    {
++      DEBUGASSERT(priv->rxb_count > 0);
++      priv->rxb_count--;
++      priv->rx_dequeued++;
++      sq_addlast(entry, &priv->freeb);
++      DEBUGASSERT(priv->free_count < WLAN_PKTBUF_NUM);
++      priv->free_count++;
++      priv->buf_recycled++;
++    }
++
++  while ((entry = sq_remfirst(&priv->txb)) != NULL)
++    {
++      sq_addlast(entry, &priv->freeb);
++      DEBUGASSERT(priv->free_count < WLAN_PKTBUF_NUM);
++      priv->free_count++;
++      priv->buf_recycled++;
++    }
++
++  if (priv->dev.d_buf != NULL)
++    {
++      struct wlan_pktbuf *pktbuf;
++
++      pktbuf = container_of(priv->dev.d_buf, struct wlan_pktbuf, buffer);
++      sq_addlast(&pktbuf->entry, &priv->freeb);
++      DEBUGASSERT(priv->free_count < WLAN_PKTBUF_NUM);
++      priv->free_count++;
++      priv->buf_recycled++;
++      priv->dev.d_buf = NULL;
++      priv->dev.d_len = 0;
++    }
++
++  priv->rx_work_pending = false;
++}
++
++static void wlan_rx_stats_report(struct wlan_priv_s *priv,
++                                 const char *reason)
++{
++  irqstate_t flags;
++  uint16_t free_count;
++  uint16_t free_min;
++  uint16_t rxb_count;
++  uint16_t rxb_highwater;
++  uint32_t rx_enqueued;
++  uint32_t rx_dequeued;
++  uint32_t buf_recycled;
++  uint32_t work_scheduled;
++  uint32_t work_failed;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  free_count = priv->free_count;
++  free_min = priv->free_min;
++  rxb_count = priv->rxb_count;
++  rxb_highwater = priv->rxb_highwater;
++  rx_enqueued = priv->rx_enqueued;
++  rx_dequeued = priv->rx_dequeued;
++  buf_recycled = priv->buf_recycled;
++  work_scheduled = priv->rx_work_scheduled;
++  work_failed = priv->rx_work_failed;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  syslog(LOG_INFO,
++         "[WLAN-RX] stats reason=%s free=%u free_min=%u "
++         "rxb=%u rxb_high=%u enq=%" PRIu32 " deq=%" PRIu32
++         " recycled=%" PRIu32 " work=%" PRIu32 " work_fail=%" PRIu32
++         " nobuf=%" PRIu32 " requeue=%" PRIu32 "\n",
++         reason ? reason : "?", (unsigned int)free_count,
++         (unsigned int)free_min, (unsigned int)rxb_count,
++         (unsigned int)rxb_highwater, rx_enqueued, rx_dequeued,
++         buf_recycled, work_scheduled, work_failed,
++         g_wlan_tls_rx_nobuf, g_wlan_tls_rx_work_requeue);
++}
++
++static void wlan_rxwork_schedule_retry(struct wlan_priv_s *priv)
++{
++  int ret;
++
++  if (!priv->ifup)
++    {
++      return;
++    }
++
++  ret = wd_start(&priv->rxretrytimer, 1, wlan_rxwork_retry_expiry,
++                 (wdparm_t)priv);
++  if (ret < 0)
++    {
++      irqstate_t flags = spin_lock_irqsave(&priv->lock);
++
++      priv->rx_work_pending = false;
++      priv->rx_work_failed++;
++      spin_unlock_irqrestore(&priv->lock, flags);
++      wlan_rx_stats_report(priv, "retry-timer-failed");
++    }
++}
+ 
++static void wlan_rxwork_retry_expiry(wdparm_t arg)
++{
++  struct wlan_priv_s *priv = (struct wlan_priv_s *)arg;
++  irqstate_t flags;
++  bool schedule = false;
++  int ret;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  if (priv->ifup && !sq_empty(&priv->rxb) && !priv->rx_work_pending)
++    {
++      priv->rx_work_pending = true;
++      priv->rx_work_scheduled++;
++      schedule = true;
++    }
++  else if (!priv->ifup || sq_empty(&priv->rxb))
++    {
++      priv->rx_work_pending = false;
++    }
+   spin_unlock_irqrestore(&priv->lock, flags);
++
++  if (!schedule)
++    {
++      return;
++    }
++
++  ret = work_queue(WLAN_WORK, &priv->rxwork, wlan_rxpoll, priv, 0);
++  if (ret < 0)
++    {
++      flags = spin_lock_irqsave(&priv->lock);
++      priv->rx_work_pending = false;
++      priv->rx_work_failed++;
++      spin_unlock_irqrestore(&priv->lock, flags);
++
++      wlan_rx_stats_report(priv, "retry-schedule-failed");
++      wlan_rxwork_schedule_retry(priv);
++    }
+ }
+ 
+ /****************************************************************************
+@@ -461,6 +1258,9 @@ static struct wlan_pktbuf *wlan_recvframe(struct wlan_priv_s *priv)
+   if (entry)
+     {
+       pktbuf = container_of(entry, struct wlan_pktbuf, entry);
++      DEBUGASSERT(priv->rxb_count > 0);
++      priv->rxb_count--;
++      priv->rx_dequeued++;
+     }
+ 
+   spin_unlock_irqrestore(&priv->lock, flags);
+@@ -518,28 +1318,128 @@ static struct wlan_pktbuf *wlan_txframe(struct wlan_priv_s *priv)
+ 
+ static void wlan_transmit(struct wlan_priv_s *priv)
+ {
++  static uint32_t submit_ok;
++  static uint32_t submit_enomem;
++  static uint32_t credit_stalls;
+   struct wlan_pktbuf *pktbuf;
+   int ret;
+ 
++  if (wlan_tx_retry_is_pending(priv))
++    {
++      return;
++    }
++
+   while ((pktbuf = wlan_txframe(priv)))
+     {
+-      ret = priv->ops->send(pktbuf->buffer, pktbuf->len);
+-      if (ret == -ENOMEM)
++      bool tls443;
++
++      /*
++       * Do not flood the Espressif dynamic TX pool.  Put the packet back at
++       * the head and wait for a TX-done callback to return a credit.
++       */
++      if (!wlan_tx_credit_take(priv))
+         {
++          credit_stalls++;
++
++          if (credit_stalls <= 8 || (credit_stalls & 0x3f) == 0)
++            {
++              syslog(LOG_INFO,
++                     "[WLAN-TXFLOW] credit stall=%" PRIu32
++                     " inflight=%u max=%u\n",
++                     credit_stalls,
++                     (unsigned int)wlan_tx_credit_count(priv),
++                     (unsigned int)WLAN_WIFI_TX_INFLIGHT_MAX);
++            }
++
+           wlan_add_txpkt_head(priv, pktbuf);
+-          wd_start(&priv->txtimeout, WLAN_TXTOUT,
+-                   wlan_txtimeout_expiry, (uint32_t)priv);
+           break;
+         }
+-      else
++
++      tls443 = wlan_diag_is_tcp443(pktbuf->buffer, pktbuf->len);
++      wlan_diag_tls_frame("TX", pktbuf->buffer, pktbuf->len);
++
++      ret = priv->ops->send(pktbuf->buffer, pktbuf->len);
++
++      if (ret < 0)
+         {
+-          if (ret < 0)
++          /* No TX-done is expected for a failed submission. */
++
++          wlan_tx_credit_release(priv);
++        }
++
++      if (ret == -ENOMEM)
++        {
++          uint32_t attempts;
++
++          submit_enomem++;
++          attempts = wlan_tx_retry_count(priv);
++
++          syslog(LOG_ERR,
++                 "[WLAN-TXFLOW] vendor ENOMEM count=%" PRIu32
++                 " len=%u inflight=%u free=%u attempt=%" PRIu32 "/%u\n",
++                 submit_enomem,
++                 (unsigned int)pktbuf->len,
++                 (unsigned int)wlan_tx_credit_count(priv),
++                 (unsigned int)priv->free_count,
++                 attempts + 1,
++                 (unsigned int)WLAN_TX_RETRY_MAX_ATTEMPTS);
++
++          if (attempts >= WLAN_TX_RETRY_MAX_ATTEMPTS)
+             {
+-              nwarn("WARN: Failed to send pkt, ret: %d\n", ret);
++              /*
++               * This is only the driver's copied Ethernet frame.  Dropping it
++               * is equivalent to ordinary link loss: TCP still owns the
++               * unacknowledged stream data and will retransmit later.
++               *
++               * Do not pin the interface forever in a driver-level retry
++               * loop when the vendor TX path is persistently out of memory.
++               */
++
++              syslog(LOG_ERR,
++                     "[WLAN-TXFLOW] retry giveup len=%u after=%" PRIu32
++                     " delayed attempts; let TCP retransmit\n",
++                     (unsigned int)pktbuf->len, attempts);
++
++              wlan_free_buffer(priv, pktbuf->buffer);
++              wlan_tx_retry_reset(priv);
++              break;
+             }
+ 
++          wlan_add_txpkt_head(priv, pktbuf);
++          wlan_tx_retry_schedule(priv);
++          break;
++        }
++
++      if (ret < 0)
++        {
++          nwarn("WARN: Failed to send pkt, ret: %d\n", ret);
+           wlan_free_buffer(priv, pktbuf->buffer);
++          continue;
+         }
++
++      submit_ok++;
++      wlan_tx_retry_reset(priv);
++
++      /*
++       * Rate-limit success logging.  Serial output from the Wi-Fi worker can
++       * itself make queue starvation worse during certificate bursts.
++       */
++      if (tls443 && (submit_ok <= 12 || (submit_ok & 0x3f) == 0))
++        {
++          syslog(LOG_INFO,
++                 "[WLAN-TXSUBMIT] ok=%" PRIu32
++                 " len=%u inflight=%u\n",
++                 submit_ok,
++                 (unsigned int)pktbuf->len,
++                 (unsigned int)wlan_tx_credit_count(priv));
++        }
++
++      /*
++       * esp_wifi_internal_tx() copies the Ethernet frame before returning,
++       * so the NuttX packet buffer can be returned immediately.  The
++       * tx_inflight credit is released later by wlan_sta_tx_done().
++       */
++      wlan_free_buffer(priv, pktbuf->buffer);
+     }
+ }
+ 
+@@ -588,8 +1488,19 @@ static int wlan_rx_done(struct wlan_priv_s *priv, void *buffer,
+ {
+   struct wlan_pktbuf *pktbuf;
+   irqstate_t flags;
++  bool schedule = false;
++  uint16_t free_count;
++  uint16_t free_min;
++  uint16_t rxb_count;
++  uint16_t rxb_highwater;
++  uint32_t rx_enqueued;
++  uint32_t rx_dequeued;
++  uint32_t buf_recycled;
++  int workret;
+   int ret = 0;
+ 
++  wlan_diag_tls_frame("RX", buffer, len);
++
+   if (!priv->ifup)
+     {
+       goto out;
+@@ -597,6 +1508,12 @@ static int wlan_rx_done(struct wlan_priv_s *priv, void *buffer,
+ 
+   if (len > WLAN_BUF_SIZE)
+     {
++      g_wlan_tls_rx_oversize++;
++      syslog(LOG_ERR,
++             "[WLAN-RX] OVERSIZE count=%" PRIu32
++             " len=%u max=%u -- dropping frame\n",
++             g_wlan_tls_rx_oversize,
++             (unsigned int)len, (unsigned int)WLAN_BUF_SIZE);
+       nwarn("ERROR: Wlan receive %d larger than %d\n",
+              len, WLAN_BUF_SIZE);
+       ret = -EINVAL;
+@@ -606,6 +1523,37 @@ static int wlan_rx_done(struct wlan_priv_s *priv, void *buffer,
+   pktbuf = wlan_alloc_buffer(priv);
+   if (!pktbuf)
+     {
++      flags = spin_lock_irqsave(&priv->lock);
++      g_wlan_tls_rx_nobuf++;
++      free_count = priv->free_count;
++      free_min = priv->free_min;
++      rxb_count = priv->rxb_count;
++      rxb_highwater = priv->rxb_highwater;
++      rx_enqueued = priv->rx_enqueued;
++      rx_dequeued = priv->rx_dequeued;
++      buf_recycled = priv->buf_recycled;
++      spin_unlock_irqrestore(&priv->lock, flags);
++
++      /* Avoid making a serial log line for every dropped frame. */
++
++      if (g_wlan_tls_rx_nobuf <= 8 ||
++          (g_wlan_tls_rx_nobuf & 0x3f) == 0)
++        {
++          syslog(LOG_ERR,
++                 "[WLAN-RX] NOBUF count=%" PRIu32
++                 " len=%u free=%u reserve=%u rxb=%u high=%u"
++                 " free_min=%u enq=%" PRIu32 " deq=%" PRIu32
++                 " recycled=%" PRIu32 " -- dropping frame\n",
++                 g_wlan_tls_rx_nobuf, (unsigned int)len,
++                 (unsigned int)free_count,
++                 (unsigned int)WLAN_RX_RESERVED_BUFS,
++                 (unsigned int)rxb_count,
++                 (unsigned int)rxb_highwater,
++                 (unsigned int)free_min,
++                 rx_enqueued, rx_dequeued, buf_recycled);
++          wlan_rx_stats_report(priv, "nobuf");
++        }
++
+       ret = -ENOBUFS;
+       goto out;
+     }
+@@ -620,11 +1568,36 @@ static int wlan_rx_done(struct wlan_priv_s *priv, void *buffer,
+ 
+   flags = spin_lock_irqsave(&priv->lock);
+   sq_addlast(&pktbuf->entry, &priv->rxb);
++  priv->rxb_count++;
++  if (priv->rxb_count > priv->rxb_highwater)
++    {
++      priv->rxb_highwater = priv->rxb_count;
++    }
++  priv->rx_enqueued++;
++  if (!priv->rx_work_pending)
++    {
++      priv->rx_work_pending = true;
++      priv->rx_work_scheduled++;
++      schedule = true;
++    }
++
+   spin_unlock_irqrestore(&priv->lock, flags);
+ 
+-  if (work_available(&priv->rxwork))
++  if (schedule)
+     {
+-      work_queue(WLAN_WORK, &priv->rxwork, wlan_rxpoll, priv, 0);
++      workret = work_queue(WLAN_WORK, &priv->rxwork, wlan_rxpoll, priv, 0);
++      if (workret < 0)
++        {
++          flags = spin_lock_irqsave(&priv->lock);
++          priv->rx_work_pending = false;
++          priv->rx_work_failed++;
++          spin_unlock_irqrestore(&priv->lock, flags);
++
++          syslog(LOG_ERR,
++                 "[WLAN-RX] work queue failed ret=%d\n", workret);
++          wlan_rx_stats_report(priv, "schedule-failed");
++          wlan_rxwork_schedule_retry(priv);
++        }
+     }
+ 
+   return 0;
+@@ -659,6 +1632,9 @@ static void wlan_rxpoll(void *arg)
+   struct eth_hdr_s *eth_hdr;
+   struct wlan_priv_s *priv = (struct wlan_priv_s *)arg;
+   struct net_driver_s *dev = &priv->dev;
++  irqstate_t flags;
++  bool requeue;
++  int workret;
+ #ifdef WLAN_RX_THRESHOLD
+   uint32_t rbytes = 0;
+ #endif
+@@ -820,6 +1796,49 @@ static void wlan_rxpoll(void *arg)
+   wlan_transmit(priv);
+ 
+   net_unlock();
++
++  /*
++   * RX callbacks can arrive while this worker is draining rxb.  The
++   * callback cannot queue the same work item while it is running, so hand
++   * the work item off to its next invocation when a frame arrived during the
++   * final empty-check.  The flag closes the race with wlan_rx_done().
++   */
++
++  flags = spin_lock_irqsave(&priv->lock);
++  requeue = priv->ifup && !sq_empty(&priv->rxb);
++  if (!requeue)
++    {
++      priv->rx_work_pending = false;
++    }
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  if (requeue)
++    {
++      g_wlan_tls_rx_work_requeue++;
++      if (g_wlan_tls_rx_work_requeue <= 8 ||
++          (g_wlan_tls_rx_work_requeue & 0x3f) == 0)
++        {
++          syslog(LOG_INFO,
++                 "[WLAN-RX] work requeue count=%" PRIu32 "\n",
++                 g_wlan_tls_rx_work_requeue);
++          wlan_rx_stats_report(priv, "requeue");
++        }
++
++      workret = work_queue_next(WLAN_WORK, &priv->rxwork, wlan_rxpoll,
++                                priv, 0);
++      if (workret < 0)
++        {
++          flags = spin_lock_irqsave(&priv->lock);
++          priv->rx_work_pending = false;
++          priv->rx_work_failed++;
++          spin_unlock_irqrestore(&priv->lock, flags);
++
++          syslog(LOG_ERR,
++                 "[WLAN-RX] work requeue failed ret=%d\n", workret);
++          wlan_rx_stats_report(priv, "requeue-failed");
++          wlan_rxwork_schedule_retry(priv);
++        }
++    }
+ }
+ 
+ /****************************************************************************
+@@ -851,9 +1870,14 @@ static int wlan_txpoll(struct net_driver_s *dev)
+ 
+   wlan_cache_txpkt_tail(priv);
+ 
+-  pktbuf = wlan_alloc_buffer(priv);
++  pktbuf = wlan_alloc_tx_buffer(priv);
+   if (!pktbuf)
+     {
++      /*
++       * Stop this devif_poll burst now.  wlan_dopoll() will immediately
++       * drain txb via wlan_transmit(), returning those buffers to freeb.
++       * RX retains WLAN_RX_RESERVED_BUFS throughout the burst.
++       */
+       return -ENOMEM;
+     }
+ 
+@@ -893,7 +1917,7 @@ static void wlan_dopoll(struct wlan_priv_s *priv)
+   uint8_t *txbuf;
+   int ret;
+ 
+-  pktbuf = wlan_alloc_buffer(priv);
++  pktbuf = wlan_alloc_tx_buffer(priv);
+   if (!pktbuf)
+     {
+       return;
+@@ -1008,6 +2032,16 @@ static void wlan_txavail_work(void *arg)
+ {
+   struct wlan_priv_s *priv = (struct wlan_priv_s *)arg;
+ 
++  /*
++   * A delayed ENOMEM retry owns TX progress for now. Do not poll the network
++   * stack for another burst until that queued packet has been retried.
++   */
++
++  if (wlan_tx_retry_is_pending(priv))
++    {
++      return;
++    }
++
+   /* Try to send all cached TX packets even if net is down */
+ 
+   wlan_transmit(priv);
+@@ -1127,10 +2161,28 @@ static int wlan_ifdown(struct net_driver_s *dev)
+   /* Cancel the TX poll timer and TX timeout timers */
+ 
+   wd_cancel(&priv->txtimeout);
++  wd_cancel(&priv->rxretrytimer);
++
++  /* Stop pending work before recycling the shared packet-buffer queues. */
++
++  work_cancel(WLAN_WORK, &priv->rxwork);
++  work_cancel(WLAN_WORK, &priv->txwork);
++  work_cancel(WLAN_WORK, &priv->retrywork);
++  work_cancel(WLAN_WORK, &priv->toutwork);
+ 
+   /* Mark the device "down" */
+ 
+   priv->ifup = false;
++  wd_cancel(&priv->retrytimer);
++
++  {
++    irqstate_t flags = spin_lock_irqsave(&priv->lock);
++
++    priv->tx_retry_pending = false;
++    priv->tx_retry_ms = WLAN_TX_RETRY_MIN_MS;
++    wlan_recycle_queues_locked(priv);
++    spin_unlock_irqrestore(&priv->lock, flags);
++  }
+ 
+   ret = priv->ops->stop();
+   if (ret < 0)
+@@ -1552,7 +2604,38 @@ static int wlan_sta_rx_done(void *buffer, uint16_t len, void *eb)
+ 
+ static void wlan_sta_tx_done(uint8_t *data, uint16_t *len, bool status)
+ {
++  static uint32_t done_count;
+   struct wlan_priv_s *priv = &g_wlan_priv[ESP32S3_WLAN_STA_DEVNO];
++  size_t frame_len = len ? (size_t)*len : 0;
++  uint16_t inflight;
++
++  if (status)
++    {
++      g_wlan_tls_txdone_ok++;
++    }
++  else
++    {
++      g_wlan_tls_txdone_fail++;
++    }
++
++  done_count++;
++  inflight = wlan_tx_credit_release(priv);
++
++  /*
++   * Log the first callbacks unconditionally.  Previous diagnostics only
++   * logged callbacks when data could be parsed as an Ethernet TCP/443 frame,
++   * which could hide successful vendor TX completions.
++   */
++  if (done_count <= 16 || !status || (done_count & 0x3f) == 0)
++    {
++      syslog(status ? LOG_INFO : LOG_ERR,
++             "[WLAN-TXDONE] count=%" PRIu32
++             " status=%d len=%zu inflight=%u ok=%" PRIu32
++             " fail=%" PRIu32 "\n",
++             done_count, status ? 1 : 0, frame_len,
++             (unsigned int)inflight,
++             g_wlan_tls_txdone_ok, g_wlan_tls_txdone_fail);
++    }
+ 
+   wlan_tx_done(priv);
+ }
+@@ -1605,6 +2688,7 @@ static void wlan_softap_tx_done(uint8_t *data, uint16_t *len, bool status)
+ {
+   struct wlan_priv_s *priv = &g_wlan_priv[ESP32S3_WLAN_SOFTAP_DEVNO];
+ 
++  wlan_tx_credit_release(priv);
+   wlan_tx_done(priv);
+ }
+ #endif /* ESP32S3_WLAN_HAS_SOFTAP */

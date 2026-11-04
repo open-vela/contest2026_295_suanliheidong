@@ -1,5 +1,5 @@
 /*
- * Contest-local observer for the official Music DJ status API.
+ * Disabled legacy observer ABI; direct playback-session events own music state.
  *
  * SPDX-License-Identifier: Apache-2.0
  */

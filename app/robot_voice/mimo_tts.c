@@ -1,3 +1,4 @@
+#include "robot_voice_diag.h"
 #include <nuttx/config.h>
 
 #include <errno.h>
@@ -12,9 +13,65 @@
 
 #include "mimo_client.h"
 #include "mimo_tts.h"
+#include "mimo_tts_stream.h"
 #include "robot_voice_config.h"
+#include "robot_voice_threads.h"
 
-#define RV_TTS_WORKER_STACK (32 * 1024)
+#define RV_TTS_WORKER_STACK ROBOT_VOICE_TTS_WORKER_STACK
+
+/* Only fixed status phrases -> validated PCM, in RAM for this boot only.
+ * Chat replies cannot evict error audio or leave conversation text in cache. */
+struct rv_cached_tts_s
+{
+  char text[97];
+  uint8_t *pcm;
+  size_t bytes;
+};
+static struct rv_cached_tts_s g_tts_cache[2];
+static unsigned int g_tts_cache_next;
+static pthread_mutex_t g_tts_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool rv_cache_eligible(const char *text)
+{
+  static const char *const fixed[] = {
+    "语音服务连接失败，请稍后再试。",
+    "模型服务连接失败，暂时无法回复。",
+    "模型服务认证失败，请检查配置。",
+    "模型服务请求失败，暂时无法回复。",
+    "服务繁忙，请稍后再试。",
+    "服务现在请求较多，暂时无法回复。",
+    "刚才没听清，请再说一次。", NULL
+  };
+  for (unsigned int i = 0; fixed[i]; i++)
+    if (!strcmp(text, fixed[i])) return true;
+  return false;
+}
+
+struct rv_cache_sink_s
+{
+  mimo_tts_pcm_cb_t callback;
+  void *arg;
+  uint8_t *pcm;
+  size_t bytes;
+  bool disabled;
+};
+
+static int rv_cache_sink(const uint8_t *pcm, size_t bytes, void *arg)
+{
+  struct rv_cache_sink_s *sink = arg;
+  if (!sink->disabled && bytes) {
+    size_t limit = 192 * 1024;
+    uint8_t *next = bytes <= limit - sink->bytes ?
+                    realloc(sink->pcm, sink->bytes + bytes) : NULL;
+    if (!next) {
+      free(sink->pcm); sink->pcm = NULL; sink->disabled = true;
+    } else {
+      sink->pcm = next;
+      memcpy(next + sink->bytes, pcm, bytes); sink->bytes += bytes;
+    }
+  }
+  return sink->callback(pcm, bytes, sink->arg);
+}
 
 static uint16_t rv_le16(const uint8_t *p)
 {
@@ -237,9 +294,9 @@ static int rv_emit_wav_pcm(uint8_t *wav, size_t wav_len,
       return -EPROTO;
     }
 
-  printf("[RV-TTS] WAV fmt pcm_s16le %luHz %uch %ubit\n",
+  RV_VERBOSE("[RV-TTS] WAV fmt pcm_s16le %luHz %uch %ubit\n",
          (unsigned long)rate, channels, bits);
-  printf("[RV-TTS] WAV data begin bytes=%zu rate=%lu parser=whole-wav "
+  RV_VERBOSE("[RV-TTS] WAV data begin bytes=%zu rate=%lu parser=whole-wav "
          "pcm_fnv=%08lx\n",
          pcm_len, (unsigned long)rate,
          (unsigned long)rv_pcm_fnv1a32(pcm, pcm_len));
@@ -282,6 +339,7 @@ struct tts_worker_s
   char *text;
   mimo_tts_pcm_cb_t cb;
   void *arg;
+  unsigned int timeout_ms;
   int result;
 };
 
@@ -382,8 +440,17 @@ static char *find_audio_data(char *json, size_t len, char **value_end)
 }
 
 static int mimo_tts_run(const char *api_key, const char *text,
-                        mimo_tts_pcm_cb_t cb, void *arg)
+                        mimo_tts_pcm_cb_t cb, void *arg,
+                        unsigned int timeout_ms)
 {
+  if (ROBOT_VOICE_TTS_STREAM && robot_mimo_agent_stream_available())
+    {
+      return mimo_tts_stream_run_timeout(api_key, text, cb, arg, timeout_ms);
+    }
+  if (ROBOT_VOICE_TTS_STREAM)
+    {
+      printf("[RV-TTS] public streaming ABI unavailable; using complete WAV compatibility\n");
+    }
   cJSON *root = NULL;
   cJSON *messages = NULL;
   cJSON *message = NULL;
@@ -445,12 +512,12 @@ static int mimo_tts_run(const char *api_key, const char *text,
   response[0] = '\0';
   response[ROBOT_VOICE_TTS_RESPONSE] = '\0';
 
-  printf("[RV-TTS] request begin body=%zu response_cap=%u voice=%s\n",
+  RV_VERBOSE("[RV-TTS] request begin body=%zu response_cap=%u voice=%s\n",
          body_len, (unsigned int)ROBOT_VOICE_TTS_RESPONSE,
          ROBOT_VOICE_TTS_VOICE);
 
-  ret = robot_mimo_post(api_key, body, body_len, response,
-                        ROBOT_VOICE_TTS_RESPONSE, &response_len);
+  ret = robot_mimo_post_timeout(api_key, body, body_len, response,
+                        ROBOT_VOICE_TTS_RESPONSE, &response_len, timeout_ms);
   if (ret < 0)
     {
       printf("[RV-TTS] transport failed rc=%d\n", ret);
@@ -466,7 +533,7 @@ static int mimo_tts_run(const char *api_key, const char *text,
     }
 
   response[response_len] = '\0';
-  printf("[RV-TTS] transport done response=%zu\n", response_len);
+  RV_VERBOSE("[RV-TTS] transport done response=%zu\n", response_len);
 
   audio_data = find_audio_data(response, response_len, &audio_end);
   if (audio_data == NULL || audio_end == NULL || audio_end <= audio_data)
@@ -493,14 +560,14 @@ static int mimo_tts_run(const char *api_key, const char *text,
     ret = rv_base64_decode_inplace(audio_data, b64_len, &wav_len);
     if (ret == 0)
       {
-        printf("[RV-TTS] base64 whole decode b64=%zu wav=%zu\n",
+        RV_VERBOSE("[RV-TTS] base64 whole decode b64=%zu wav=%zu\n",
                b64_len, wav_len);
 
         ret = rv_emit_wav_pcm((uint8_t *)audio_data, wav_len,
                               tts_sink, &sink, &pcm_len);
       }
 
-    printf("[RV-TTS] decode done b64=%zu wav=%zu pcm=%zu result=%d "
+    RV_VERBOSE("[RV-TTS] decode done b64=%zu wav=%zu pcm=%zu result=%d "
            "parser=whole-wav\n",
            b64_len, wav_len, pcm_len, ret);
   }
@@ -520,13 +587,60 @@ out:
 static void *mimo_tts_worker(void *arg)
 {
   struct tts_worker_s *work = arg;
+  bool eligible = rv_cache_eligible(work->text);
+  if (eligible) {
+    pthread_mutex_lock(&g_tts_cache_lock);
+    for (unsigned int i = 0; i < 2; i++) {
+      if (g_tts_cache[i].pcm && !strcmp(work->text, g_tts_cache[i].text)) {
+        RV_VERBOSE("[RV-TTS-CACHE] hit bytes=%zu\n", g_tts_cache[i].bytes);
+        work->result = work->cb(g_tts_cache[i].pcm, g_tts_cache[i].bytes, work->arg);
+        pthread_mutex_unlock(&g_tts_cache_lock);
+        return NULL;
+      }
+    }
+    pthread_mutex_unlock(&g_tts_cache_lock);
+  }
+  struct rv_cache_sink_s sink = {
+    .callback = work->cb, .arg = work->arg, .disabled = !eligible,
+  };
 
-  printf("[RV-TTS] worker start stack=%u\n",
+  RV_VERBOSE("[RV-TTS] worker start stack=%u\n",
          (unsigned int)RV_TTS_WORKER_STACK);
   work->result = mimo_tts_run(work->api_key, work->text,
-                              work->cb, work->arg);
-  printf("[RV-TTS] worker done rc=%d\n", work->result);
+                              rv_cache_sink, &sink, work->timeout_ms);
+  if (work->result == 0 && sink.pcm && sink.bytes && !sink.disabled) {
+    pthread_mutex_lock(&g_tts_cache_lock);
+    struct rv_cached_tts_s *entry = &g_tts_cache[g_tts_cache_next++ % 2];
+    free(entry->pcm);
+    entry->pcm = sink.pcm; sink.pcm = NULL; entry->bytes = sink.bytes;
+    snprintf(entry->text, sizeof(entry->text), "%s", work->text);
+    pthread_mutex_unlock(&g_tts_cache_lock);
+    RV_VERBOSE("[RV-TTS-CACHE] stored bytes=%zu\n", sink.bytes);
+  }
+  free(sink.pcm);
+  RV_VERBOSE("[RV-TTS] worker done rc=%d\n", work->result);
   return NULL;
+}
+
+int mimo_tts_speak_stream_on_worker_timeout(const char *api_key, const char *text,
+                                   mimo_tts_pcm_cb_t cb, void *arg,
+                                   unsigned int timeout_ms)
+{
+  if (!api_key || !api_key[0] || !text || !text[0] || !cb) return -EINVAL;
+  /* Producer owns these strings for the entire synchronous call. No extra
+   * per-sentence task, stack or key/text copy is needed here. */
+  struct tts_worker_s work = {
+    .api_key = (char *)api_key, .text = (char *)text,
+    .cb = cb, .arg = arg, .timeout_ms = timeout_ms, .result = -EIO,
+  };
+  mimo_tts_worker(&work);
+  return work.result;
+}
+
+int mimo_tts_speak_stream_on_worker(const char *api_key, const char *text,
+                                   mimo_tts_pcm_cb_t cb, void *arg)
+{
+  return mimo_tts_speak_stream_on_worker_timeout(api_key, text, cb, arg, 0);
 }
 
 int mimo_tts_speak_stream(const char *api_key, const char *text,
@@ -565,7 +679,7 @@ int mimo_tts_speak_stream(const char *api_key, const char *text,
       return -ret;
     }
 
-  ret = pthread_attr_setstacksize(&attr, RV_TTS_WORKER_STACK);
+  ret = rv_thread_attributes(&attr, RV_TTS_WORKER_STACK, ROBOT_VOICE_NETWORK_PRIORITY);
   if (ret == 0)
     {
       ret = pthread_create(&thread, &attr, mimo_tts_worker, &work);

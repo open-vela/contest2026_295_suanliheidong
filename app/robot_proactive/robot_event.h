@@ -56,6 +56,7 @@ struct robot_event_payload_s
       struct
         {
           enum robot_music_state_e state;
+          uint32_t session_id;
           uint16_t tempo_bpm;
           char track[64];
           char category[32];

@@ -26,6 +26,8 @@
 static pthread_mutex_t g_robot_skill_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_robot_skill_exists;
 static bool g_robot_skill_matches;
+static bool g_music_skills_ready;
+static bool g_companion_skills_ready;
 static int g_robot_skill_last_result = -EAGAIN;
 static size_t g_skill_current;
 static size_t g_skill_created;
@@ -291,6 +293,29 @@ int robot_skill_installer_ensure(void)
   printf("[ROBOT-SKILL] dir=%s stage=check-dir result=ready\n",
          AGENT_SKILLS_DIR);
 
+  /* Remove only names retired by the contest bundle.  User-created skills
+   * with other names remain untouched. */
+  {
+    const char *retired[] =
+      {
+        "food_fitness_advisor.md",
+        "proactive-food-coach.md",
+        "meal-companion.md",
+      };
+    for (size_t retired_i = 0;
+         retired_i < sizeof(retired) / sizeof(retired[0]); retired_i++)
+      {
+        char path[ROBOT_SKILL_PATH_SIZE];
+        snprintf(path, sizeof(path), "%s%s", AGENT_SKILLS_DIR,
+                 retired[retired_i]);
+        if (unlink(path) == 0)
+          {
+            printf("[ROBOT-SKILL] retired name=%s removed=1\n",
+                   retired[retired_i]);
+          }
+      }
+  }
+
   for (i = 0; i < contest_skill_resource_count; i++)
     {
       ret = robot_skill_sync_one(&contest_skill_resources[i],
@@ -324,6 +349,65 @@ int robot_skill_installer_ensure(void)
           }
       }
   }
+
+  /* Same filenames replace installed official/stale copies atomically. The
+   * companion message also carries these compiled rules, independent of a
+   * loader cache populated before voice_channel_init(). */
+  g_music_skills_ready = true;
+  const char *required_music[] = {"music-dj.md", "robot-music-companion.md"};
+  for (size_t required = 0; required < 2; required++)
+    {
+      bool matches = false;
+      for (i = 0; i < contest_skill_resource_count; i++)
+        if (strcmp(contest_skill_resources[i].filename, required_music[required]) == 0)
+          {
+            char path[ROBOT_SKILL_PATH_SIZE];
+            snprintf(path, sizeof(path), "%s%s", AGENT_SKILLS_DIR, required_music[required]);
+            matches = robot_skill_matches(&contest_skill_resources[i], path);
+            break;
+          }
+      printf("[ROBOT-SKILL] music override name=%s verified=%d\n",
+             required_music[required], matches);
+      if (!matches) { g_music_skills_ready = false; if (!first_error) first_error = -ENOENT; }
+    }
+
+  /* These files are the contest robot-dog companion surface.  Music events
+   * inline robot-music-companion; ordinary voice and idle turns discover the
+   * other skills through the official Agent summary. */
+  g_companion_skills_ready = g_music_skills_ready;
+  const char *required_companion[] =
+    {
+      "robot-voice-companion.md",
+      "robot-proactive-idle.md",
+      "robot-meal-companion.md",
+      "expressive-companion.md",
+    };
+  for (size_t required = 0;
+       required < sizeof(required_companion) / sizeof(required_companion[0]);
+       required++)
+    {
+      bool matches = false;
+      for (i = 0; i < contest_skill_resource_count; i++)
+        if (strcmp(contest_skill_resources[i].filename,
+                   required_companion[required]) == 0)
+          {
+            char path[ROBOT_SKILL_PATH_SIZE];
+            snprintf(path, sizeof(path), "%s%s", AGENT_SKILLS_DIR,
+                     required_companion[required]);
+            matches = robot_skill_matches(&contest_skill_resources[i], path);
+            break;
+          }
+      printf("[ROBOT-SKILL] companion name=%s verified=%d\n",
+             required_companion[required], matches);
+      if (!matches)
+        {
+          g_companion_skills_ready = false;
+          if (!first_error)
+            {
+              first_error = -ENOENT;
+            }
+        }
+    }
 
   g_robot_skill_last_result = first_error != 0 ? first_error :
     (g_skill_created != 0 ? ROBOT_SKILL_INSTALL_CREATED :
@@ -435,4 +519,22 @@ const char *robot_skill_installer_result_name(int result)
       default:
         return "failed";
     }
+}
+
+bool robot_skill_installer_music_ready(void)
+{
+  bool ready;
+  pthread_mutex_lock(&g_robot_skill_lock);
+  ready = g_music_skills_ready;
+  pthread_mutex_unlock(&g_robot_skill_lock);
+  return ready;
+}
+
+bool robot_skill_installer_companion_ready(void)
+{
+  bool ready;
+  pthread_mutex_lock(&g_robot_skill_lock);
+  ready = g_companion_skills_ready;
+  pthread_mutex_unlock(&g_robot_skill_lock);
+  return ready;
 }

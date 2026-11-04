@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <nuttx/timers/pwm.h>
@@ -34,8 +35,8 @@
 #define ROBOTCTL_SERVO_PERIOD_US  20000
 #define ROBOTCTL_SERVO_MIN_US     500
 #define ROBOTCTL_SERVO_MAX_US     2500
-#define ROBOTCTL_NORMAL_UPDATE_MS 10
 #define ROBOTCTL_SAFE_STEP_DEG    3
+#define ROBOTCTL_LIMB_MIN_INTERVAL_MS 30
 #define ROBOTCTL_RAMP_START_PERCENT 20
 #define ROBOTCTL_RAMP_END_PERCENT   80
 
@@ -199,6 +200,30 @@ static bool robotctl_servo_cancelled(struct robotctl_servo_ctx_s *ctx)
          ctx->cancel_check(ctx->cancel_arg);
 }
 
+/* Keep a PWM step from running early when a task is interrupted by a signal. */
+static void robotctl_delay_ms(int delay_ms)
+{
+  struct timespec request;
+  struct timespec remaining;
+
+  if (delay_ms <= 0)
+    {
+      return;
+    }
+
+  request.tv_sec = delay_ms / 1000;
+  request.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
+  while (nanosleep(&request, &remaining) < 0)
+    {
+      if (errno != EINTR)
+        {
+          break;
+        }
+
+      request = remaining;
+    }
+}
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -282,6 +307,25 @@ void robotctl_servo_close(struct robotctl_servo_ctx_s *ctx)
 {
   if (ctx->fd >= 0)
     {
+      /* A caller may close the context after a multi-servo frame or an
+       * error path.  Always remove the PWM waveform before releasing the
+       * device so an idle context cannot leave a servo actively driven. */
+      if (ctx->pwm_enabled)
+        {
+          int ret = ioctl(ctx->fd, PWMIOC_STOP, 0);
+
+          if (ret < 0)
+            {
+              fprintf(stderr,
+                      "robotctl: close could not stop PWM errno=%d\n",
+                      errno);
+            }
+          else
+            {
+              ctx->pwm_enabled = false;
+            }
+        }
+
       close(ctx->fd);
       ctx->fd = -1;
     }
@@ -328,6 +372,14 @@ int robotctl_servo_move_one(struct robotctl_servo_ctx_s *ctx,
   int step_index = 0;
   int delay_ms;
   int ret;
+
+  /* Enforce the reduced limb cadence at the lowest motion layer.  Tail
+   * movement has its own profile and is intentionally excluded. */
+  if (servo != ROBOTCTL_TAIL && interval_ms <
+      ROBOTCTL_LIMB_MIN_INTERVAL_MS)
+    {
+      interval_ms = ROBOTCTL_LIMB_MIN_INTERVAL_MS;
+    }
 
   target = robotctl_clamp_angle(target);
   current = ctx->angle[servo];
@@ -387,9 +439,9 @@ int robotctl_servo_move_one(struct robotctl_servo_ctx_s *ctx,
       frame[servo] = next;
       if (step_index == 0)
         {
-          printf("[ROBOT-SERVO] first-frame servo=%s fd=%d current=%d "
-                 "target=%d\n", robotctl_servo_name(servo), ctx->fd,
-                 current, target);
+          printf("[ROBOT-SERVO] profile servo=%s step_deg=%d interval_ms=%d "
+                 "current=%d target=%d\n", robotctl_servo_name(servo),
+                 ROBOTCTL_SAFE_STEP_DEG, interval_ms, current, target);
         }
       ret = robotctl_apply_frame(ctx, frame, 1u << servo);
       if (ret < 0)
@@ -424,7 +476,7 @@ int robotctl_servo_move_one(struct robotctl_servo_ctx_s *ctx,
             {
               delay_ms += interval_ms / 4;
             }
-          usleep(delay_ms * 1000);
+          robotctl_delay_ms(delay_ms);
         }
     }
   while (current != target);
@@ -439,7 +491,7 @@ int robotctl_servo_move_one(struct robotctl_servo_ctx_s *ctx,
           return -ECANCELED;
         }
 
-      usleep(slice_ms * 1000);
+      robotctl_delay_ms(slice_ms);
       settle_ms -= slice_ms;
     }
 
@@ -460,13 +512,38 @@ int robotctl_servo_move_all(struct robotctl_servo_ctx_s *ctx,
 {
   int frame[ROBOTCTL_SERVO_COUNT];
   int start[ROBOTCTL_SERVO_COUNT];
+  int max_delta = 0;
+  int angle_steps;
+  int time_steps;
   int steps;
   int ret;
   int i;
   int step;
 
   memcpy(start, ctx->angle, sizeof(start));
-  steps = duration_ms / ROBOTCTL_NORMAL_UPDATE_MS;
+  for (i = 0; i < ROBOTCTL_SERVO_COUNT; i++)
+    {
+      int delta = abs(target[i] - start[i]);
+
+      if (delta > max_delta)
+        {
+          max_delta = delta;
+        }
+    }
+
+  /* Keep this legacy entry point on the same conservative cadence and
+   * per-frame angle bound as robotctl_servo_move_one().  A short duration
+   * must not collapse a 45-degree home correction into one PWM frame. */
+  if (duration_ms < ROBOTCTL_LIMB_MIN_INTERVAL_MS)
+    {
+      duration_ms = ROBOTCTL_LIMB_MIN_INTERVAL_MS;
+    }
+
+  angle_steps = (max_delta + ROBOTCTL_SAFE_STEP_DEG - 1) /
+                ROBOTCTL_SAFE_STEP_DEG;
+  time_steps = (duration_ms + ROBOTCTL_LIMB_MIN_INTERVAL_MS - 1) /
+               ROBOTCTL_LIMB_MIN_INTERVAL_MS;
+  steps = angle_steps > time_steps ? angle_steps : time_steps;
   if (steps < 1)
     {
       steps = 1;
@@ -488,10 +565,17 @@ int robotctl_servo_move_all(struct robotctl_servo_ctx_s *ctx,
 
       if (step != steps)
         {
-          usleep(ROBOTCTL_NORMAL_UPDATE_MS * 1000);
+          robotctl_delay_ms(ROBOTCTL_LIMB_MIN_INTERVAL_MS);
         }
     }
 
   memcpy(ctx->angle, target, sizeof(ctx->angle));
+  for (i = 0; i < ROBOTCTL_SERVO_COUNT; i++)
+    {
+      ctx->angle_known[i] = true;
+      g_servo_runtime.angle[i] = ctx->angle[i];
+      g_servo_runtime.angle_known[i] = true;
+    }
+
   return 0;
 }

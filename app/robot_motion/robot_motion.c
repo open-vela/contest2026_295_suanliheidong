@@ -19,10 +19,27 @@
 #include "robot_motion.h"
 #include "robotctl_servo.h"
 
+extern void robot_world_state_set_motion_active(bool) __attribute__((weak));
+extern bool robot_music_media_is_active(void) __attribute__((weak));
+extern bool robot_music_media_motion_allowed(uint32_t) __attribute__((weak));
+extern int robot_music_media_claim_tail(uint32_t, uint32_t) __attribute__((weak));
+extern int robot_music_media_claim_periodic_tail(uint32_t, uint32_t) __attribute__((weak));
+
+static bool robot_motion_music_active(void)
+{ return robot_music_media_is_active && robot_music_media_is_active(); }
+
 #define ROBOT_MOTION_PHASE_COUNT 8
-#define ROBOT_MOTION_HOME_INTERVAL_MS 30
 #define ROBOT_MOTION_HOME_SETTLE_MS 200
 #define ROBOT_MOTION_WORKER_STACK 8192
+
+/* Increase limb movement time by 25% to reduce acceleration and peak load.
+ * Tail motion uses a separate timing profile below. */
+#define ROBOT_MOTION_LIMB_TIME_NUM 5
+#define ROBOT_MOTION_LIMB_TIME_DEN 4
+/* Keep the home profile at the same conservative cadence as gait motion.
+ * The previous fixed home profile used 30 ms; retaining that floor avoids a
+ * fast reset when the requested gait period maps to a 25 ms interval. */
+#define ROBOT_MOTION_LIMB_MIN_INTERVAL_MS 30
 
 #define ROBOT_MOTION_PHASE(rf, rr, lr, lf, first, second) \
   { {rf, rr, lr, lf, 85}, {first, second} }
@@ -60,6 +77,7 @@ struct robot_motion_context_s
   uint32_t completed_request_id;
   bool cancel_requested;
   int last_result;
+  int music_tail_direction;
 };
 
 static struct robot_motion_context_s g_motion =
@@ -67,6 +85,7 @@ static struct robot_motion_context_s g_motion =
   .lock = PTHREAD_MUTEX_INITIALIZER,
   .cond = PTHREAD_COND_INITIALIZER,
   .state = ROBOT_MOTION_STATE_IDLE,
+  .music_tail_direction = -1,
 };
 
 static uint64_t robot_motion_now_ms(void)
@@ -89,8 +108,15 @@ static bool robot_motion_cancel_check(void *arg)
   (void)arg;
   pthread_mutex_lock(&g_motion.lock);
   cancel_requested = g_motion.cancel_requested;
+  enum robot_motion_source_e source = g_motion.request.source;
+  enum robot_motion_request_type_e type = g_motion.request.type;
+  uint32_t session = g_motion.request.music_session_id;
   pthread_mutex_unlock(&g_motion.lock);
-  return cancel_requested;
+  if (source == ROBOT_MOTION_SOURCE_MUSIC)
+    return cancel_requested || !robot_music_media_motion_allowed ||
+           !robot_music_media_motion_allowed(session);
+  return cancel_requested ||
+         (type == ROBOT_MOTION_REQUEST_GAIT && robot_motion_music_active());
 }
 
 static const enum robotctl_servo_e g_home_order[ROBOTCTL_SERVO_COUNT] =
@@ -176,10 +202,18 @@ robot_motion_gait(enum robot_motion_direction_e direction)
     }
 }
 
+static int robot_motion_scale_interval(int interval_ms)
+{
+  return (interval_ms * ROBOT_MOTION_LIMB_TIME_NUM +
+          ROBOT_MOTION_LIMB_TIME_DEN - 1) /
+         ROBOT_MOTION_LIMB_TIME_DEN;
+}
+
 static int robot_motion_safe_interval(unsigned int period_ms)
 {
-  /* Keep the 3-degree POWER_SAFE increments, but reduce idle time between
-   * PWM frames so the requested period has a meaningful speed effect. */
+  /* Keep the 3-degree POWER_SAFE increments.  The additional 5/4 time
+   * scale lowers limb speed by approximately 25% without changing gait
+   * geometry or the independent tail profile. */
   int interval_ms = (int)period_ms / 125;
 
   if (interval_ms < 12)
@@ -191,7 +225,18 @@ static int robot_motion_safe_interval(unsigned int period_ms)
       interval_ms = 24;
     }
 
+  interval_ms = robot_motion_scale_interval(interval_ms);
+  if (interval_ms < ROBOT_MOTION_LIMB_MIN_INTERVAL_MS)
+    {
+      interval_ms = ROBOT_MOTION_LIMB_MIN_INTERVAL_MS;
+    }
+
   return interval_ms;
+}
+
+int robot_motion_limb_interval(unsigned int period_ms)
+{
+  return robot_motion_safe_interval(period_ms);
 }
 
 static int robot_motion_safe_settle(unsigned int period_ms)
@@ -210,65 +255,31 @@ static int robot_motion_safe_settle(unsigned int period_ms)
   return settle_ms;
 }
 
-/*
- * Tail sweep profile tuned for a smoother visible wag.
- *
- * The motion layer now travels in large ~24-degree segments so PWM is not
- * stopped every 10 degrees.  robotctl_servo_move_one() still keeps its own
- * small safe PWM ramp internally, so this is not a one-frame 24-degree jump.
- *
- * Requested demo geometry:
- *   center -> +25 deg -> -24 deg -> center
- *
- * The cross-side move is split into 24/25-degree powered segments with a short
- * unloaded recovery gap.  This removes most of the old stop/start feeling
- * while retaining a brownout recovery window.
- */
-#define ROBOT_MOTION_TAIL_SEGMENT_DEG 24
-#define ROBOT_MOTION_TAIL_DIRECT_LIMIT_DEG 25
-#define ROBOT_MOTION_TAIL_RIGHT_OFFSET_DEG 25
-#define ROBOT_MOTION_TAIL_LEFT_OFFSET_DEG 24
+/* One-degree pulses separated by unloaded recovery gaps. The request's
+ * amplitude is the actual endpoint offset; only the tail channel is touched. */
+#define ROBOT_MOTION_TAIL_SEGMENT_DEG 1
 #define ROBOT_MOTION_TAIL_OPEN_RECOVERY_MS 500
-/* 50 Hz PWM = 20 ms per period.  One endpoint period is enough here because
- * the servo layer already keeps PWM active throughout its internal 3-degree
- * ramp for the whole 24/25-degree segment. */
 #define ROBOT_MOTION_TAIL_ENDPOINT_SETTLE_MS 20
 
 static int robot_motion_tail_interval(unsigned int period_ms)
 {
-  /* Keep one 50 Hz period between the servo layer's internal 3-degree updates.
-   * A nearly fixed 20-24 ms cadence makes a 24/25-degree sweep look continuous
-   * without extending the powered window more than necessary. */
-  int interval_ms = (int)period_ms / 140;
-
-  if (interval_ms < 20)
-    {
-      interval_ms = 20;
-    }
-  else if (interval_ms > 24)
-    {
-      interval_ms = 24;
-    }
-
-  return interval_ms;
+  (void)period_ms;
+  return 20;
 }
 
-static int robot_motion_tail_cooldown_ms(unsigned int period_ms)
+static int robot_motion_tail_reset_interval(void)
 {
-  /* Large segments reduce the number of PWM stop/start cycles.  Keep a short
-   * unloaded gap for the servo rail, but avoid the old half-second pause. */
-  int cooldown_ms = (int)period_ms / 10;
+  return robot_motion_limb_interval(ROBOT_MOTION_DEFAULT_WALK_PERIOD);
+}
 
-  if (cooldown_ms < 260)
-    {
-      cooldown_ms = 260;
-    }
-  else if (cooldown_ms > 320)
-    {
-      cooldown_ms = 320;
-    }
+static int robot_motion_tail_cooldown_ms(unsigned int period_ms,
+                                         unsigned int amplitude_deg)
+{
+  int interval_ms = robot_motion_tail_interval(period_ms);
 
-  return cooldown_ms;
+  /* center -> +A -> -A -> center has 4*A one-degree movements. */
+  return (int)(period_ms / (4U * amplitude_deg)) -
+         interval_ms - ROBOT_MOTION_TAIL_ENDPOINT_SETTLE_MS;
 }
 
 static int robot_motion_tail_cooldown(int cooldown_ms)
@@ -305,7 +316,7 @@ static int robot_motion_tail_micro_move(struct robotctl_servo_ctx_s *ctx,
 
   /*
    * robotctl_servo_move_one() stops PWM when the micro-move completes.  Keep
-   * the rail unloaded briefly before the next 24/25-degree segment.
+   * the rail unloaded briefly before the next one-degree segment.
    */
   return robot_motion_tail_cooldown(cooldown_ms);
 }
@@ -333,24 +344,8 @@ static int robot_motion_tail_ramp_to(struct robotctl_servo_ctx_s *ctx,
         }
 
       delta = target - current;
-      if (delta >= -ROBOT_MOTION_TAIL_DIRECT_LIMIT_DEG &&
-          delta <= ROBOT_MOTION_TAIL_DIRECT_LIMIT_DEG)
-        {
-          /* Avoid a tiny 1-degree tail segment at a 25-degree endpoint. */
-          next = target;
-        }
-      else if (delta > ROBOT_MOTION_TAIL_SEGMENT_DEG)
-        {
-          next = current + ROBOT_MOTION_TAIL_SEGMENT_DEG;
-        }
-      else if (delta < -ROBOT_MOTION_TAIL_SEGMENT_DEG)
-        {
-          next = current - ROBOT_MOTION_TAIL_SEGMENT_DEG;
-        }
-      else
-        {
-          next = target;
-        }
+      next = current + (delta > 0 ? ROBOT_MOTION_TAIL_SEGMENT_DEG :
+                                     -ROBOT_MOTION_TAIL_SEGMENT_DEG);
 
       printf("[ROBOT-MOTION] tail soft-step %d -> %d target=%d\n",
              current, next, target);
@@ -367,23 +362,39 @@ static int robot_motion_tail_ramp_to(struct robotctl_servo_ctx_s *ctx,
 }
 
 static int robot_motion_home_power_safe(struct robotctl_servo_ctx_s *ctx,
-                                        bool include_tail)
+                                        bool include_tail,
+                                        int interval_ms)
 {
   int count = include_tail ? ROBOTCTL_SERVO_COUNT : ROBOTCTL_SERVO_COUNT - 1;
   int i;
+
+  if (interval_ms <= 0)
+    {
+      interval_ms = robot_motion_safe_interval(
+        ROBOT_MOTION_DEFAULT_WALK_PERIOD);
+    }
+
+  if (interval_ms < ROBOT_MOTION_LIMB_MIN_INTERVAL_MS)
+    {
+      interval_ms = ROBOT_MOTION_LIMB_MIN_INTERVAL_MS;
+    }
+
+  printf("[ROBOT-MOTION] home profile interval=%d settle=%d\n",
+         interval_ms, ROBOT_MOTION_HOME_SETTLE_MS);
 
   for (i = 0; i < count; i++)
     {
       enum robotctl_servo_e servo = g_home_order[i];
       int ret;
 
+      if (robot_motion_music_active()) return -ECANCELED;
       printf("[ROBOT-MOTION] home move %s %d -> %d update=%s\n",
              robotctl_servo_name(servo), ctx->angle[servo],
              g_robotctl_home[servo],
              ctx->angle_known[servo] &&
              ctx->angle[servo] == g_robotctl_home[servo] ? "no" : "yes");
       ret = robotctl_servo_move_one(ctx, servo, g_robotctl_home[servo],
-                                    ROBOT_MOTION_HOME_INTERVAL_MS,
+                                    interval_ms,
                                     ROBOT_MOTION_HOME_SETTLE_MS);
       if (ret < 0)
         {
@@ -499,7 +510,7 @@ static int robot_motion_execute_gait(
          interval_ms + interval_ms / 4, settle_ms);
   printf("[ROBOT-MOTION] preparing request id=%lu home_required=yes\n",
          (unsigned long)request->request_id);
-  ret = robot_motion_home_power_safe(&ctx, false);
+  ret = robot_motion_home_power_safe(&ctx, false, interval_ms);
   if (ret >= 0)
     {
       for (cycle = 0; cycle < request->steps && ret >= 0; cycle++)
@@ -557,7 +568,7 @@ static int robot_motion_execute_gait(
   if (ret >= 0)
     {
       ret = robot_motion_cancel_check(NULL) ? -ECANCELED :
-            robot_motion_home_power_safe(&ctx, false);
+            robot_motion_home_power_safe(&ctx, false, interval_ms);
     }
 
   printf("[ROBOT-MOTION] summary writes=%u skipped=%u total_angle_delta=%u "
@@ -572,19 +583,19 @@ static int robot_motion_execute_tail_wag(
 {
   struct robotctl_servo_ctx_s ctx;
   const int center = g_robotctl_home[ROBOTCTL_TAIL];
-  const int right = center + ROBOT_MOTION_TAIL_RIGHT_OFFSET_DEG;
-  const int left = center - ROBOT_MOTION_TAIL_LEFT_OFFSET_DEG;
+  const int right = center + (int)request->amplitude_deg;
+  const int left = center - (int)request->amplitude_deg;
   int interval_ms = robot_motion_tail_interval(request->period_ms);
-  int cooldown_ms = robot_motion_tail_cooldown_ms(request->period_ms);
+  int reset_interval_ms = robot_motion_tail_reset_interval();
+  int cooldown_ms = robot_motion_tail_cooldown_ms(request->period_ms, request->amplitude_deg);
   int ret;
   unsigned int cycle;
 
   printf("[ROBOT-MOTION] tail wag begin cycles=%u requested_amplitude=%u "
          "right_offset=%d left_offset=%d period_ms=%u interval_ms=%d "
-         "cooldown_ms=%d segment_deg=%d profile=smooth_sweep\n",
+         "cooldown_ms=%d segment_deg=%d profile=music_micro_wag\n",
          request->steps, request->amplitude_deg,
-         ROBOT_MOTION_TAIL_RIGHT_OFFSET_DEG,
-         ROBOT_MOTION_TAIL_LEFT_OFFSET_DEG,
+         (int)request->amplitude_deg, (int)request->amplitude_deg,
          request->period_ms, interval_ms, cooldown_ms,
          ROBOT_MOTION_TAIL_SEGMENT_DEG);
 
@@ -596,6 +607,11 @@ static int robot_motion_execute_tail_wag(
 
   ctx.cancel_check = robot_motion_cancel_check;
   ctx.cancel_arg = NULL;
+  if (abs(ctx.angle[ROBOTCTL_TAIL] - center) > ROBOT_MOTION_TAIL_MAX_AMPLITUDE)
+    {
+      robotctl_servo_close(&ctx);
+      return -ERANGE; /* Do not make a large centering move during music. */
+    }
 
   /*
    * Give the supply rail time to settle after opening the PWM backend.  This
@@ -603,18 +619,11 @@ static int robot_motion_execute_tail_wag(
    */
   ret = robot_motion_tail_cooldown(ROBOT_MOTION_TAIL_OPEN_RECOVERY_MS);
 
-  /*
-   * Smooth sweep pattern:
-   *
-   *   center -> right(+25) -> left(-24) -> center
-   *
-   * The right-to-left transition no longer returns to center first.  It is
-   * split internally into 24/25-degree motion segments, each of which still
-   * uses robotctl_servo_move_one()'s smaller safe PWM ramp.
-   */
+  /* Return through center using only bounded one-degree tail pulses. */
   if (ret >= 0)
     {
-      ret = robot_motion_tail_ramp_to(&ctx, center, interval_ms, cooldown_ms);
+      ret = robot_motion_tail_ramp_to(&ctx, center, reset_interval_ms,
+                                      cooldown_ms);
     }
 
   for (cycle = 0; ret >= 0 && cycle < request->steps; cycle++)
@@ -641,18 +650,109 @@ static int robot_motion_execute_tail_wag(
           printf("[ROBOT-MOTION] tail wag cycle=%u/%u sweep=left->center\n",
                  cycle + 1, request->steps);
           ret = robot_motion_tail_ramp_to(&ctx, center,
-                                          interval_ms, cooldown_ms);
+                                          reset_interval_ms, cooldown_ms);
         }
     }
 
   if (ret >= 0 && ctx.angle[ROBOTCTL_TAIL] != center)
     {
       ret = robot_motion_tail_ramp_to(&ctx, center,
-                                      interval_ms, cooldown_ms);
+                                      reset_interval_ms, cooldown_ms);
+    }
+
+  if (ret >= 0) ret = robot_motion_tail_cooldown(ROBOT_MOTION_TAIL_OPEN_RECOVERY_MS);
+  robotctl_servo_close(&ctx);
+  printf("[ROBOT-MOTION] tail wag done rc=%d\n", ret);
+  return ret;
+}
+
+/* Move one bounded music step. The companion scheduler submits this request
+ * every 1000 ms, so the worker never holds the servo rail for the whole song. */
+static int robot_motion_execute_music_tail_step(
+    const struct robot_motion_request_s *request)
+{
+  struct robotctl_servo_ctx_s ctx;
+  const int center = g_robotctl_home[ROBOTCTL_TAIL];
+  const int left = center - ROBOT_MOTION_MUSIC_TAIL_LIMIT_DEG;
+  const int right = center + ROBOT_MOTION_MUSIC_TAIL_LIMIT_DEG;
+  int direction;
+  int current;
+  int target;
+  int ret;
+
+  if (request == NULL || request->amplitude_deg !=
+      ROBOT_MOTION_MUSIC_TAIL_STEP_DEG || request->period_ms !=
+      ROBOT_MOTION_MUSIC_TAIL_STEP_MS)
+    {
+      return -EINVAL;
+    }
+
+  if (robot_motion_cancel_check(NULL)) return -ECANCELED;
+
+  ret = robotctl_servo_open(&ctx);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ctx.cancel_check = robot_motion_cancel_check;
+  ctx.cancel_arg = NULL;
+  current = ctx.angle[ROBOTCTL_TAIL];
+  pthread_mutex_lock(&g_motion.lock);
+  direction = g_motion.music_tail_direction < 0 ? -1 : 1;
+  if (current <= left)
+    {
+      direction = 1;
+    }
+  else if (current >= right)
+    {
+      direction = -1;
+    }
+  pthread_mutex_unlock(&g_motion.lock);
+
+  target = current + direction * ROBOT_MOTION_MUSIC_TAIL_STEP_DEG;
+  if (current < left && target > left)
+    {
+      target = left;
+    }
+  else if (current > right && target < right)
+    {
+      target = right;
+    }
+  else if (current >= left && current <= right)
+    {
+      if (target < left)
+        {
+          target = left;
+        }
+      else if (target > right)
+        {
+          target = right;
+        }
+    }
+
+  printf("[ROBOT-MOTION] music tail step %d -> %d direction=%s\n",
+         current, target, direction < 0 ? "left" : "right");
+  ret = robot_motion_tail_micro_move(&ctx, target, 20, 80);
+  if (ret >= 0)
+    {
+      pthread_mutex_lock(&g_motion.lock);
+      if (target <= left)
+        {
+          g_motion.music_tail_direction = 1;
+        }
+      else if (target >= right)
+        {
+          g_motion.music_tail_direction = -1;
+        }
+      else
+        {
+          g_motion.music_tail_direction = direction;
+        }
+      pthread_mutex_unlock(&g_motion.lock);
     }
 
   robotctl_servo_close(&ctx);
-  printf("[ROBOT-MOTION] tail wag done rc=%d\n", ret);
   return ret;
 }
 
@@ -677,7 +777,14 @@ static void *robot_motion_worker(void *arg)
       g_motion.state = ROBOT_MOTION_STATE_RUNNING;
       pthread_mutex_unlock(&g_motion.lock);
 
-      if (request.type == ROBOT_MOTION_REQUEST_TAIL_WAG)
+      if (robot_world_state_set_motion_active) robot_world_state_set_motion_active(true);
+      if (request.source == ROBOT_MOTION_SOURCE_MUSIC)
+        {
+          printf("[ROBOT-MOTION] start id=%lu action=music_tail_step\n",
+                 (unsigned long)request.request_id);
+          ret = robot_motion_execute_music_tail_step(&request);
+        }
+      else if (request.type == ROBOT_MOTION_REQUEST_TAIL_WAG)
         {
           printf("[ROBOT-MOTION] start id=%lu action=tail_wag\n",
                  (unsigned long)request.request_id);
@@ -699,6 +806,7 @@ static void *robot_motion_worker(void *arg)
           ret = robot_motion_execute_gait(&request);
         }
 
+      if (robot_world_state_set_motion_active) robot_world_state_set_motion_active(false);
       pthread_mutex_lock(&g_motion.lock);
       g_motion.last_result = ret;
       g_motion.completed_request_id = request.request_id;
@@ -822,7 +930,8 @@ static int robot_motion_submit_request(
     enum robot_motion_source_e source,
     enum robot_motion_request_type_e type,
     enum robot_motion_direction_e direction,
-    unsigned int steps, unsigned int period_ms, unsigned int amplitude_deg)
+    unsigned int steps, unsigned int period_ms, unsigned int amplitude_deg,
+    uint32_t music_session_id)
 {
   int ret;
   uint32_t request_id;
@@ -831,13 +940,15 @@ static int robot_motion_submit_request(
       type < 0 || type >= ROBOT_MOTION_REQUEST_TYPE_COUNT ||
       direction < 0 || direction >= ROBOT_MOTION_DIRECTION_COUNT ||
       steps < ROBOT_MOTION_MIN_STEPS || steps > ROBOT_MOTION_MAX_STEPS ||
-      period_ms < ROBOT_MOTION_MIN_PERIOD ||
-      period_ms > ROBOT_MOTION_MAX_PERIOD)
+      (type == ROBOT_MOTION_REQUEST_GAIT &&
+       (period_ms < ROBOT_MOTION_MIN_PERIOD ||
+        period_ms > ROBOT_MOTION_MAX_PERIOD)))
     {
       return -EINVAL;
     }
 
   if (type == ROBOT_MOTION_REQUEST_TAIL_WAG &&
+      source != ROBOT_MOTION_SOURCE_MUSIC &&
       (steps < ROBOT_MOTION_TAIL_MIN_CYCLES ||
        steps > ROBOT_MOTION_TAIL_MAX_CYCLES ||
        period_ms < ROBOT_MOTION_TAIL_MIN_PERIOD ||
@@ -847,6 +958,22 @@ static int robot_motion_submit_request(
     {
       return -EINVAL;
     }
+
+  if (source == ROBOT_MOTION_SOURCE_MUSIC &&
+      (type != ROBOT_MOTION_REQUEST_TAIL_WAG ||
+       period_ms != ROBOT_MOTION_MUSIC_TAIL_STEP_MS ||
+       amplitude_deg != ROBOT_MOTION_MUSIC_TAIL_STEP_DEG))
+    {
+      return -EINVAL;
+    }
+
+  if (robot_motion_music_active() &&
+      (type == ROBOT_MOTION_REQUEST_GAIT || source != ROBOT_MOTION_SOURCE_MUSIC))
+    return -EPERM;
+  if (source == ROBOT_MOTION_SOURCE_MUSIC &&
+      (music_session_id == 0 || !robot_music_media_motion_allowed ||
+       !robot_music_media_motion_allowed(music_session_id)))
+    return -EAGAIN;
 
   ret = robot_motion_init();
   if (ret < 0)
@@ -882,6 +1009,7 @@ static int robot_motion_submit_request(
   g_motion.request.steps = steps;
   g_motion.request.period_ms = period_ms;
   g_motion.request.amplitude_deg = amplitude_deg;
+  g_motion.request.music_session_id = music_session_id;
   g_motion.request.request_id = request_id;
   g_motion.cancel_requested = false;
   g_motion.request_pending = true;
@@ -910,7 +1038,7 @@ int robot_motion_submit(enum robot_motion_source_e source,
                         unsigned int steps, unsigned int period_ms)
 {
   return robot_motion_submit_request(source, ROBOT_MOTION_REQUEST_GAIT,
-                                     direction, steps, period_ms, 0);
+                                     direction, steps, period_ms, 0, 0);
 }
 
 static uint32_t robot_motion_elapsed_ms(const struct timespec *start)
@@ -954,6 +1082,15 @@ uint32_t robot_motion_default_timeout(unsigned int steps,
   if (timeout > ROBOT_MOTION_MAX_TIMEOUT_MS)
     {
       timeout = ROBOT_MOTION_MAX_TIMEOUT_MS;
+    }
+
+  /* A gait includes a sequential home pass, eight phases, and a final home
+   * pass.  The requested gait period alone does not cover those operations.
+   * Keep a one-step request from being cancelled while its bounded servo
+   * ramps are still running. */
+  if (timeout < ROBOT_MOTION_MIN_TIMEOUT_MS)
+    {
+      timeout = ROBOT_MOTION_MIN_TIMEOUT_MS;
     }
 
   return (uint32_t)timeout;
@@ -1081,6 +1218,9 @@ int robot_motion_submit_and_wait(enum robot_motion_source_e source,
       else
         {
           motion_result = g_motion.last_result;
+          /* The worker completed between the timed wait and this check.
+           * Preserve its result instead of reporting a spurious timeout. */
+          wait_result = 0;
         }
       pthread_mutex_unlock(&g_motion.lock);
 
@@ -1124,9 +1264,9 @@ int robot_motion_execute_sync(enum robot_motion_source_e source,
     robot_motion_default_timeout(steps, period_ms), &result);
 }
 
-int robot_motion_tail_wag_sync(enum robot_motion_source_e source,
+static int robot_motion_tail_wag_for_session(enum robot_motion_source_e source,
                                unsigned int cycles, unsigned int period_ms,
-                               unsigned int amplitude_deg)
+                               unsigned int amplitude_deg, uint32_t session_id)
 {
   int request_id;
   int motion_result;
@@ -1153,7 +1293,7 @@ int robot_motion_tail_wag_sync(enum robot_motion_source_e source,
 
   request_id = robot_motion_submit_request(
     source, ROBOT_MOTION_REQUEST_TAIL_WAG, ROBOT_MOTION_FORWARD, cycles,
-    period_ms, amplitude_deg);
+    period_ms, amplitude_deg, session_id);
   if (request_id < 0)
     {
       return request_id;
@@ -1199,11 +1339,50 @@ int robot_motion_tail_wag_sync(enum robot_motion_source_e source,
   return motion_result;
 }
 
+int robot_motion_tail_wag_sync(enum robot_motion_source_e source,
+                               unsigned int cycles, unsigned int period_ms,
+                               unsigned int amplitude_deg)
+{
+  if (source == ROBOT_MOTION_SOURCE_MUSIC) return -EPERM;
+  return robot_motion_tail_wag_for_session(source, cycles, period_ms, amplitude_deg, 0);
+}
+
+int robot_motion_music_tail_wag_sync(uint32_t session_id, uint32_t event_id,
+                                     unsigned int period_ms,
+                                     unsigned int amplitude_deg)
+{
+  int ret;
+  if (period_ms < ROBOT_MOTION_TAIL_MIN_PERIOD ||
+      period_ms > ROBOT_MOTION_TAIL_MAX_PERIOD ||
+      amplitude_deg < ROBOT_MOTION_TAIL_MIN_AMPLITUDE ||
+      amplitude_deg > ROBOT_MOTION_TAIL_MAX_AMPLITUDE) return -EINVAL;
+  if (robot_motion_is_busy()) return -EBUSY;
+  if (!robot_music_media_claim_tail) return -ENOSYS;
+  ret = robot_music_media_claim_tail(session_id, event_id);
+  if (ret < 0) return ret;
+  return robot_motion_tail_wag_for_session(ROBOT_MOTION_SOURCE_MUSIC, 1,
+                                           period_ms, amplitude_deg, session_id);
+}
+
+int robot_motion_music_tail_repeat_async(uint32_t session_id, uint32_t event_id)
+{
+  int ret;
+  if (robot_motion_is_busy()) return -EBUSY;
+  if (!robot_music_media_claim_periodic_tail) return -ENOSYS;
+  ret = robot_music_media_claim_periodic_tail(session_id, event_id);
+  if (ret < 0) return ret;
+  return robot_motion_submit_request(ROBOT_MOTION_SOURCE_MUSIC,
+    ROBOT_MOTION_REQUEST_TAIL_WAG, ROBOT_MOTION_FORWARD, 1,
+    ROBOT_MOTION_MUSIC_TAIL_STEP_MS, ROBOT_MOTION_MUSIC_TAIL_STEP_DEG,
+    session_id);
+}
+
 int robot_motion_home_sync(void)
 {
   struct robotctl_servo_ctx_s ctx;
   int ret;
 
+  if (robot_motion_music_active()) return -EPERM;
   pthread_mutex_lock(&g_motion.lock);
   if (g_motion.request_pending ||
       g_motion.state == ROBOT_MOTION_STATE_RUNNING)
@@ -1219,7 +1398,9 @@ int robot_motion_home_sync(void)
   printf("[ROBOT-MOTION] backend init done rc=%d\n", ret);
   if (ret >= 0)
     {
-      ret = robot_motion_home_power_safe(&ctx, true);
+      ret = robot_motion_home_power_safe(
+        &ctx, true,
+        robot_motion_safe_interval(ROBOT_MOTION_DEFAULT_WALK_PERIOD));
       robotctl_servo_close(&ctx);
     }
 
@@ -1230,6 +1411,31 @@ int robot_motion_home_sync(void)
   pthread_cond_broadcast(&g_motion.cond);
   pthread_mutex_unlock(&g_motion.lock);
   return ret;
+}
+
+int robot_motion_quiesce_music(void)
+{
+  uint32_t request_id;
+  pthread_mutex_lock(&g_motion.lock);
+  if (g_motion.request.source != ROBOT_MOTION_SOURCE_MUSIC ||
+      (!g_motion.request_pending && g_motion.state != ROBOT_MOTION_STATE_RUNNING)) {
+    pthread_mutex_unlock(&g_motion.lock);
+    return 0;
+  }
+  request_id = g_motion.request.request_id;
+  g_motion.cancel_requested = true;
+  if (g_motion.request_pending) {
+    g_motion.request_pending = false;
+    g_motion.completed_request_id = request_id;
+    g_motion.last_result = -ECANCELED;
+    g_motion.state = ROBOT_MOTION_STATE_IDLE;
+    pthread_cond_broadcast(&g_motion.cond);
+  }
+  pthread_mutex_unlock(&g_motion.lock);
+  /* Reuse the existing monotonic, bounded waiter. Driver stalls must report
+   * failure rather than hold every later conversation indefinitely. */
+  return robot_motion_wait_timeout(request_id,
+    2U * ROBOT_MOTION_MUSIC_TAIL_STEP_MS, NULL);
 }
 
 bool robot_motion_is_busy(void)

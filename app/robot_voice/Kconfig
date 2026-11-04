@@ -2,5 +2,8 @@ config LVX_USE_DEMO_CONTEST2026_295_ROBOT_VOICE
 	bool "Contest robot voice"
 	default n
 	depends on I2S && AUDIO && NETUTILS_CJSON
+	depends on TFLITEMICRO
 	---help---
-		Build the independent MiMo robot_voice one-shot voice application.
+		Build robot_voice with local INT8 TFLite Micro acoustic wakeword.
+		Import a validated model bundle before building. Cloud ASR is used
+		only for conversation commands after acoustic activation.

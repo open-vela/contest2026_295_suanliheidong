@@ -1,67 +1,78 @@
 #!/usr/bin/env python3
-"""Generate a raw-byte C resource table for contest-local Markdown Skills."""
-
+"""Embed the explicitly approved contest Skill resources."""
 import argparse
+import json
 from pathlib import Path
+import sys
 
 
-def c_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+def manifest_files(directory, manifest_path):
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f'cannot read skill manifest: {exc}') from exc
+
+    entries = manifest.get('skills')
+    if not isinstance(entries, list) or not entries:
+        raise ValueError('manifest skills must be a non-empty list')
+
+    files = []
+    names = set()
+    for entry in entries:
+        if isinstance(entry, str):
+            name = entry
+        elif isinstance(entry, dict):
+            name = entry.get('file')
+        else:
+            name = None
+        if not isinstance(name, str) or not name or '/' in name or not name.endswith('.md'):
+            raise ValueError(f'invalid skill filename: {name!r}')
+        if name in names:
+            raise ValueError(f'duplicate skill in manifest: {name}')
+        names.add(name)
+        path = Path(directory) / name
+        if not path.is_file():
+            raise ValueError(f'manifest skill is missing: {path}')
+        files.append(path)
+
+    for retired in manifest.get('retired', []):
+        path = Path(directory) / retired
+        if path.exists():
+            raise ValueError(f'retired skill still present: {path}')
+    return files
 
 
-def byte_array(name: str, data: bytes) -> str:
-    if not data:
-        return f"static const unsigned char {name}[1] = {{ 0 }};\n"
-
-    lines = []
-    for offset in range(0, len(data), 12):
-        values = ", ".join(f"0x{byte:02x}" for byte in data[offset:offset + 12])
-        lines.append(f"  {values},")
-    lines[-1] = lines[-1][:-1]
-    return (
-        f"static const unsigned char {name}[{len(data) or 1}] = {{\n"
-        + "\n".join(lines)
-        + "\n};\n"
-    )
-
-
-def generate(input_dir: Path, output: Path) -> None:
-    skills = sorted(input_dir.glob("*.md"), key=lambda path: path.name)
-    chunks = [
-        "/* Generated file. Do not edit. */\n",
-        '#include "contest_skill_resource.h"\n\n',
-    ]
-
-    for index, skill in enumerate(skills):
-        data = skill.read_bytes()
-        chunks.append(byte_array(f"contest_skill_content_{index}", data))
-        chunks.append("\n")
-
-    chunks.append("const struct contest_skill_resource_s contest_skill_resources[] = {\n")
-    for index, skill in enumerate(skills):
-        data = skill.read_bytes()
-        chunks.append(
-            f"  {{ {c_string(skill.name)}, contest_skill_content_{index}, "
-            f"{len(data)} }},\n"
-        )
-    if not skills:
-        chunks.append("  { NULL, NULL, 0 },\n")
-    chunks.append("};\n\n")
-    chunks.append(f"const size_t contest_skill_resource_count = {len(skills)};\n")
-
+def generate(directory, output, manifest=None):
+    files = (manifest_files(directory, manifest) if manifest else
+             sorted(Path(directory).glob('*.md')))
+    lines = ['/* Generated from contest Markdown assets. */',
+             '#include "contest_skill_resource.h"']
+    for i, path in enumerate(files):
+        data = path.read_bytes()
+        lines.append('static const unsigned char skill_%d[] = {%s};' %
+                     (i, ','.join(str(b) for b in data + b'\0')))
+    lines.append('const struct contest_skill_resource_s contest_skill_resources[] = {')
+    for i, path in enumerate(files):
+        lines.append('  {%s, skill_%d, sizeof(skill_%d)-1},' %
+                     (json.dumps(path.name), i, i))
+    if not files:
+        lines.append('  {0, 0, 0},')
+        print('[voice-build] no contest skills/*.md supplied; voice remains available', file=sys.stderr)
+    lines.extend(('};', 'const size_t contest_skill_resource_count = %d;' % len(files), ''))
+    output = Path(output)
+    data = '\n'.join(lines).encode('utf-8')
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("".join(chunks), encoding="ascii")
+    if not output.is_file() or output.read_bytes() != data:
+        output.write_bytes(data)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--manifest', type=Path)
     args = parser.parse_args()
-    generate(args.input, args.output)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        generate(args.input, args.output, args.manifest)
+    except ValueError as exc:
+        parser.error(str(exc))

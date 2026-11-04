@@ -1,7 +1,9 @@
+#include "robot_voice_diag.h"
 #include <nuttx/config.h>
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +42,9 @@
 #define ROBOT_VOICE_RX_POLL_MS          50
 #define ROBOT_VOICE_RX_TIMEOUT_MS       1000
 #define ROBOT_VOICE_RECORD_GUARD_MS     2000
+
+/* The stream and diagnostic finite recordings share one physical RX port. */
+static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct robot_voice_transfer_s
 {
@@ -106,9 +111,9 @@ static void robot_voice_rx_callback(FAR struct i2s_dev_s *dev,
       return;
     }
 
-  if (transfer->chunk < 2 || result < 0)
+  if ((ROBOT_VOICE_LOG_VERBOSE && transfer->chunk < 2) || result < 0)
     {
-      printf("[RV-CAP] callback chunk=%u rc=%d bytes=%zu\n",
+      RV_VERBOSE("[RV-CAP] callback chunk=%u rc=%d bytes=%zu\n",
              transfer->chunk, result, nbytes);
     }
 
@@ -239,18 +244,18 @@ static int robot_voice_rx_slot_submit(FAR struct i2s_dev_s *mic,
   slot->chunk = chunk;
   robot_voice_transfer_init(slot->transfer, true, chunk);
 
-  if (chunk < 2)
+  if (ROBOT_VOICE_LOG_VERBOSE && chunk < 2)
     {
-      printf("[RV-CAP] receive submit chunk=%u logical=%zu\n",
+      RV_VERBOSE("[RV-CAP] receive submit chunk=%u logical=%zu\n",
              chunk, request_bytes);
     }
 
   ret = I2S_RECEIVE(mic, slot->apb, robot_voice_rx_callback,
                     slot->transfer,
                     MSEC2TICK(ROBOT_VOICE_RX_TIMEOUT_MS));
-  if (chunk < 2 || ret < 0)
+  if ((ROBOT_VOICE_LOG_VERBOSE && chunk < 2) || ret < 0)
     {
-      printf("[RV-CAP] I2S_RECEIVE chunk=%u rc=%d\n", chunk, ret);
+      RV_VERBOSE("[RV-CAP] I2S_RECEIVE chunk=%u rc=%d\n", chunk, ret);
     }
 
   if (ret < 0)
@@ -346,7 +351,7 @@ static int robot_voice_rx_abort(FAR struct i2s_dev_s *mic,
     }
 
   stop_ret = I2S_IOCTL(mic, AUDIOIOC_STOP, 0);
-  printf("[RV-CAP] abort stop rc=%d\n", stop_ret);
+  RV_VERBOSE("[RV-CAP] abort stop rc=%d\n", stop_ret);
   return stop_ret;
 }
 
@@ -401,7 +406,7 @@ static int robot_voice_rx_copy(FAR const struct robot_voice_rx_slot_s *slot,
   return OK;
 }
 
-int robot_voice_capture_record_interruptible(
+static int robot_voice_capture_record_internal(
   uint8_t *buf, size_t cap, size_t *out_len, unsigned int duration_ms,
   FAR volatile bool *stop_requested)
 {
@@ -445,21 +450,21 @@ int robot_voice_capture_record_interruptible(
     }
 
   ret = I2S_RXCHANNELS(mic, ROBOT_VOICE_CHANNELS);
-  printf("[RV-CAP] set channels %d rc=%d\n", ROBOT_VOICE_CHANNELS, ret);
+  RV_VERBOSE("[RV-CAP] set channels %d rc=%d\n", ROBOT_VOICE_CHANNELS, ret);
   if (ret < 0)
     {
       return ret;
     }
 
   ret = (int)I2S_RXSAMPLERATE(mic, ROBOT_VOICE_CAPTURE_RATE);
-  printf("[RV-CAP] set rate %d rc=%d\n", ROBOT_VOICE_CAPTURE_RATE, ret);
+  RV_VERBOSE("[RV-CAP] set rate %d rc=%d\n", ROBOT_VOICE_CAPTURE_RATE, ret);
   if (ret != ROBOT_VOICE_CAPTURE_RATE)
     {
       return ret < 0 ? ret : -ENOTSUP;
     }
 
   ret = (int)I2S_RXDATAWIDTH(mic, ROBOT_VOICE_BITS);
-  printf("[RV-CAP] set width %d rc=%d\n", ROBOT_VOICE_BITS, ret);
+  RV_VERBOSE("[RV-CAP] set width %d rc=%d\n", ROBOT_VOICE_BITS, ret);
   if (ret != ROBOT_VOICE_BITS)
     {
       return ret < 0 ? ret : -ENOTSUP;
@@ -467,7 +472,7 @@ int robot_voice_capture_record_interruptible(
 
   board_voice_mic_set_diagnostics(false);
   ret = I2S_IOCTL(mic, AUDIOIOC_START, 0);
-  printf("[RV-CAP] start rc=%d\n", ret);
+  RV_VERBOSE("[RV-CAP] start rc=%d\n", ret);
   if (ret < 0)
     {
       return ret;
@@ -481,7 +486,7 @@ int robot_voice_capture_record_interruptible(
   deadline = clock_systime_ticks() +
              MSEC2TICK(duration_ms + ROBOT_VOICE_RECORD_GUARD_MS);
 
-  printf("[RV-CAP] recording %u ms target=%zu chunk=%d slots=%d warmup=%d\n",
+  RV_VERBOSE("[RV-CAP] recording %u ms target=%zu chunk=%d slots=%d warmup=%d\n",
          duration_ms, target, ROBOT_VOICE_RX_DMA_BYTES,
          ROBOT_VOICE_RX_SLOT_COUNT, ROBOT_VOICE_RX_WARMUP_CHUNKS);
 
@@ -537,7 +542,7 @@ int robot_voice_capture_record_interruptible(
           warmup_chunks++;
           if (warmup_chunks == ROBOT_VOICE_RX_WARMUP_CHUNKS)
             {
-              printf("[RV-CAP] warmup discarded=%u chunks\n", warmup_chunks);
+              RV_VERBOSE("[RV-CAP] warmup discarded=%u chunks\n", warmup_chunks);
             }
         }
       else
@@ -584,7 +589,7 @@ int robot_voice_capture_record_interruptible(
     }
 
   ret = I2S_IOCTL(mic, AUDIOIOC_STOP, 0);
-  printf("[RV-CAP] stop complete rc=%d submitted=%u completed=%u\n",
+  RV_VERBOSE("[RV-CAP] stop complete rc=%d submitted=%u completed=%u\n",
          ret, submitted, completed);
   if (ret < 0)
     {
@@ -592,8 +597,8 @@ int robot_voice_capture_record_interruptible(
     }
 
   *out_len = used;
-  printf("[RV-CAP] captured %zu bytes\n", used);
-  printf("[RV-CAP] capture complete\n");
+  RV_VERBOSE("[RV-CAP] captured %zu bytes\n", used);
+  RV_VERBOSE("[RV-CAP] capture complete\n");
   return OK;
 
 errout:
@@ -608,4 +613,158 @@ int robot_voice_capture_record(uint8_t *buf, size_t cap, size_t *out_len,
 {
   return robot_voice_capture_record_interruptible(buf, cap, out_len,
                                                   duration_ms, NULL);
+}
+
+int robot_voice_capture_record_interruptible(
+  uint8_t *buf, size_t cap, size_t *out_len, unsigned int duration_ms,
+  FAR volatile bool *stop_requested)
+{
+  int ret = pthread_mutex_trylock(&g_capture_lock);
+
+  if (ret != 0)
+    {
+      return -ret;
+    }
+
+  ret = robot_voice_capture_record_internal(buf, cap, out_len, duration_ms,
+                                            stop_requested);
+  pthread_mutex_unlock(&g_capture_lock);
+  return ret;
+}
+
+int robot_voice_capture_stream(robot_voice_capture_sink_t sink, void *arg,
+                                FAR volatile bool *stop_requested)
+{
+  FAR struct i2s_dev_s *mic;
+  struct robot_voice_rx_slot_s slots[ROBOT_VOICE_RX_SLOT_COUNT];
+  uint8_t frame[ROBOT_VOICE_RX_DMA_BYTES];
+  unsigned int chunk = 0;
+  unsigned int index = 0;
+  unsigned int warmup = 0;
+  bool started = false;
+  int ret;
+
+  if (sink == NULL || stop_requested == NULL)
+    {
+      return -EINVAL;
+    }
+
+  ret = pthread_mutex_trylock(&g_capture_lock);
+  if (ret != 0)
+    {
+      return -ret;
+    }
+
+  memset(slots, 0, sizeof(slots));
+  mic = board_voice_mic_i2s();
+  if (mic == NULL)
+    {
+      ret = -ENODEV;
+      goto out;
+    }
+
+  ret = I2S_RXCHANNELS(mic, ROBOT_VOICE_CHANNELS);
+  if (ret < 0)
+    {
+      goto out;
+    }
+
+  ret = (int)I2S_RXSAMPLERATE(mic, ROBOT_VOICE_CAPTURE_RATE);
+  if (ret != ROBOT_VOICE_CAPTURE_RATE)
+    {
+      ret = ret < 0 ? ret : -ENOTSUP;
+      goto out;
+    }
+
+  ret = (int)I2S_RXDATAWIDTH(mic, ROBOT_VOICE_BITS);
+  if (ret != ROBOT_VOICE_BITS)
+    {
+      ret = ret < 0 ? ret : -ENOTSUP;
+      goto out;
+    }
+
+  board_voice_mic_set_diagnostics(false);
+  ret = I2S_IOCTL(mic, AUDIOIOC_START, 0);
+  if (ret < 0)
+    {
+      goto out;
+    }
+
+  started = true;
+  for (index = 0; index < ROBOT_VOICE_RX_SLOT_COUNT; index++)
+    {
+      ret = robot_voice_rx_slot_submit(mic, &slots[index],
+                                       ROBOT_VOICE_RX_DMA_BYTES, chunk++);
+      if (ret < 0)
+        {
+          goto out;
+        }
+    }
+
+  index = 0;
+  RV_VERBOSE("[RV-CAP] continuous RX started, chunk=%u slots=%u\n",
+         ROBOT_VOICE_RX_DMA_BYTES, ROBOT_VOICE_RX_SLOT_COUNT);
+  while (!robot_voice_capture_stop_requested(stop_requested))
+    {
+      FAR struct robot_voice_rx_slot_s *slot = &slots[index];
+      clock_t deadline = clock_systime_ticks() +
+        MSEC2TICK(ROBOT_VOICE_RX_TIMEOUT_MS + ROBOT_VOICE_RECORD_GUARD_MS);
+      size_t used = 0;
+
+      ret = robot_voice_rx_slot_wait_interruptible(slot, deadline,
+                                                   stop_requested);
+      if (ret < 0)
+        {
+          goto out;
+        }
+
+      if (warmup < ROBOT_VOICE_RX_WARMUP_CHUNKS)
+        {
+          warmup++;
+        }
+      else
+        {
+          ret = robot_voice_rx_copy(slot, frame, sizeof(frame), &used);
+          if (ret < 0)
+            {
+              goto out;
+            }
+        }
+
+      robot_voice_rx_slot_release(slot);
+      /* Requeue RX before running the application sink, so DMA stays ahead. */
+      ret = robot_voice_rx_slot_submit(mic, slot, ROBOT_VOICE_RX_DMA_BYTES,
+                                       chunk++);
+      if (ret < 0)
+        {
+          goto out;
+        }
+
+      index = (index + 1) % ROBOT_VOICE_RX_SLOT_COUNT;
+      if (used != 0)
+        {
+          ret = sink(frame, used, arg);
+          if (ret < 0)
+            {
+              goto out;
+            }
+        }
+    }
+
+  ret = 0;
+out:
+  if (started)
+    {
+      /* Preserve heap-owned abandoned callback cleanup on every exit. */
+      (void)robot_voice_rx_abort(mic, slots);
+    }
+
+  if (ret == -ECANCELED && robot_voice_capture_stop_requested(stop_requested))
+    {
+      ret = 0;
+    }
+
+  RV_VERBOSE("[RV-CAP] continuous RX stopped rc=%d chunks=%u\n", ret, chunk);
+  pthread_mutex_unlock(&g_capture_lock);
+  return ret;
 }

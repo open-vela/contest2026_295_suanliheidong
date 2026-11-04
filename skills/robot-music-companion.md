@@ -1,91 +1,34 @@
 # Robot Music Companion
 
-Handle structured music context events from the robot proactive runtime and
-turn them into visible, physical companion behavior.
+<!-- contest-skill: role=event, source=contest, runtime=music-confirmation -->
 
 ## When to use
+收到 [ROBOT_INTERNAL_EVENT] 且 type=music_started、music_changed、music_stopped 时，
+立即使用本 contest Skill。source=music-dma 表示本地 DMA 已实际播放过 PCM。
+本规则随事件完整提供，官方 music-dj 的播放建议不能替代本事件的陪伴行为。
+session_id、event_id 是运行时令牌，只能使用当前事件给定的值。
 
-Use when the input contains `[ROBOT_INTERNAL_EVENT]` with:
-- `type=music_started`
-- `type=music_changed`
-- `type=music_stopped`
+## music_started / music_changed
+播放确认事件会自动启用整首歌曲的本地陪伴策略，无需调用任何动作工具。
+OLED 使用 `singing` 动态表情资源持续播放动画；高优先级语音或系统表情可以临时覆盖，
+音乐表情会在覆盖结束后恢复。
 
-These fields are observations from the robot's music source, not user speech.
+普通歌曲的尾巴由本地 motion worker 驱动：每 1000 ms 移动 3 度，先从当前位置逐步到
+左侧安全端点，再逐步到右侧安全端点，随后反向循环。端点限制为中心的 +/-45 度，
+每次只使用尾巴舵机并在步进之间释放 PWM。
 
-## Strong trigger rule
+每个步进都会重新检查播放会话、实际音频输出、电源风险、对话、TTS 和动作占用。
+条件不满足时跳过该步，播放恢复后本地继续；不重新请求大模型，也不根据歌曲节拍作出未经测量的声明。
+助眠、冥想或摇篮曲事件可关闭尾巴，但仍保留 listening/singing 表情策略。
 
-A `music_started` event is itself a request for proactive companion behavior.
-
-Do NOT wait for the user to additionally say:
-- "摇尾巴"
-- "换表情"
-- "开心一点"
-- "跳舞"
-
-When music is confirmed playing, the default behavior is:
-1. choose and call one `robot_react`;
-2. when safe and the mood is not explicitly calm/sleepy, call
-   `robot_tail_wag` once using safe defaults;
-3. normally do not speak, so TTS does not interrupt the song.
-
-## music_started
-
-For `type=music_started`:
-
-1. Read only supplied facts such as track, category, mood, and tempo.
-2. Call `robot_react`.
-3. Unless the supplied context is calm, sleep, meditation, lullaby, or a
-   physical motion is already busy, call `robot_tail_wag` once.
-4. Do not call another music-control Tool; playback already started.
-
-Reaction selection:
-- energetic / fast / upbeat -> `excited` or `cool`;
-- happy / pop / ordinary unknown mood -> `singing` or `happy`;
-- playful -> `playful`;
-- calm / sleep / lullaby -> `sleepy`.
-
-If mood/tempo is unknown, default to `singing` plus one safe tail wag.
-
-## music_changed
-
-For a meaningful `type=music_changed`:
-- update the face with one `robot_react`;
-- one safe tail wag is allowed when the new track is energetic or playful;
-- do not wag repeatedly for metadata noise or duplicate events.
+不要调用 `robot_music_react`、通用 `robot_react` 或 `robot_tail_wag` 叠加一次性动作，
+也不要循环调用 `robot_music_companion`。事件本身已经是播放确认，后续调度完全由本地运行时处理。
 
 ## music_stopped
+运行时立即撤销陪伴许可、取消尾巴动作并清除音乐表情。
+本事件不再调用任何工具，不播放额外 TTS；迟到事件不能影响新歌曲。
 
-For `type=music_stopped`:
-- do not call `robot_tail_wag`;
-- a short `happy` reaction is optional;
-- do not claim playback continues.
-
-## Tool policy
-
-Use:
-- `robot_react` for temporary visible music reactions;
-- `robot_tail_wag` for one bounded safe physical response.
-
-Prefer `robot_react` over persistent `robot_set_expression` for automatic music
-personality.
-
-Do not use `robot_move` for ordinary music. Walking while music plays is not a
-default behavior.
-
-For `robot_tail_wag`, prefer no optional numeric arguments so the current
-power-safe defaults are used. Never expose or invent servo angles, PWM values,
-or low-level motor instructions.
-
-## Output policy
-
-A music context event usually needs no spoken sentence at all.
-
-Prefer:
-`robot_react -> robot_tail_wag`
-
-over:
-`robot_react -> long TTS response`
-
-Never call `music_play`, `music_pause`, `music_resume`, or another
-music-control Tool in response to the internal event; the event already came
-from the official player.
+## Tool and output limits
+禁止 music_search/music_play/music_status/music_pause/music_resume、robot_play_music、
+第二播放器、轮询观察器、robot_move、四腿 gait 和姿态动作。
+禁止说话、确认语音、TTS 或长文本；完成工具后留空回复即可。

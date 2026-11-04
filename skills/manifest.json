@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "runtime_directory": "/data/agent/skills/",
+  "official_fallback_directory": "packages/ai_agent/agent_skills",
+  "precedence": [
+    "contest bundle",
+    "official built-in skills",
+    "user-installed skills"
+  ],
+  "skills": [
+    {"file": "expressive-companion.md", "role": "router"},
+    {"file": "feishu-send.md", "role": "workflow"},
+    {"file": "music-dj.md", "role": "override", "overrides": "music-dj.md"},
+    {"file": "robot-meal-companion.md", "role": "domain"},
+    {"file": "robot-music-companion.md", "role": "event"},
+    {"file": "robot-proactive-idle.md", "role": "event"},
+    {"file": "robot-voice-companion.md", "role": "router"}
+  ],
+  "retired": [
+    "food_fitness_advisor.md",
+    "proactive-food-coach.md",
+    "meal-companion.md"
+  ]
+}

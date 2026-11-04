@@ -1,0 +1,23 @@
+diff --git a/server/media_player.c b/server/media_player.c
+index 54f9f05..2292166 100644
+--- a/server/media_player.c
++++ b/server/media_player.c
+@@ -910,4 +910,18 @@ static int media_player_open_demuxer(MediaPlayerContext* ctx, const char* filename)
+     }
+     media_player_map_protocol(ctx, filename, name, MAX_URL_SIZE);
+ 
++    /* CDN audio URLs can close a TCP connection before Content-Length is
++     * reached. The HTTP protocol supports Range recovery, but its retry
++     * options default to disabled. Limit retries so a broken URL still
++     * fails instead of stalling the media worker indefinitely. */
++    if (!strncmp(name, "http://", 7) || !strncmp(name, "https://", 8)) {
++        av_dict_set(&ctx->format_opt, "reconnect", "1", 0);
++        av_dict_set(&ctx->format_opt, "reconnect_streamed", "1", 0);
++        av_dict_set(&ctx->format_opt, "reconnect_on_network_error", "1", 0);
++        av_dict_set(&ctx->format_opt, "reconnect_max_retries", "3", 0);
++        av_dict_set(&ctx->format_opt, "reconnect_delay_max", "2", 0);
++        av_dict_set(&ctx->format_opt, "reconnect_delay_total_max", "8", 0);
++        MEDIA_INFO("HTTP input reconnect enabled (max_retries=3)\n");
++    }
++
+     MEDIA_INFO("ctx %p url %s start open input.\n", ctx, name);

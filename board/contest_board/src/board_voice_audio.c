@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * F7P Media PCM bridge with exact terminal short-tail playback:
+ * Native Media PCM bridge with DMA-backed buffer ownership:
  *
  *   FFmpeg/Media decoded PCM16LE 24 kHz mono
  *       -> /dev/audio/pcm0p
@@ -14,9 +14,11 @@
  * or pcm_decode.  Media owns decoding; robot_audio_playback owns the single
  * verified hardware playback path.
  *
- * F7H additionally preserves NuttX Audio timing semantics: an APB is returned
- * to FFmpeg only after its PCM duration has elapsed, instead of immediately
- * after copying it into robot_audio_playback's private ring.
+ * A copied period is not a played period. The bridge returns APBs on the
+ * decoded PCM timeline so Media can continue feeding the private playback
+ * ring; I2S callbacks remain the source of actual speaker progress. Never
+ * infer EOF from PAUSE or a network gap. FINAL drains; STOP/FLUSH abort and
+ * return all owned APBs.
  ****************************************************************************/
 
 /****************************************************************************
@@ -36,6 +38,7 @@
 #include <unistd.h>
 
 #include <nuttx/audio/audio.h>
+#include <nuttx/clock.h>
 #include <nuttx/semaphore.h>
 
 #include <arch/board/board.h>
@@ -49,25 +52,25 @@
 #define CONTEST_MEDIA_BITS          16
 #define CONTEST_MEDIA_NBUFFERS      6
 #define CONTEST_MEDIA_BUFFER_BYTES  4096
-
-/* F7H: pace AUDIO_CALLBACK_DEQUEUE at the real PCM consumption rate.
- *
- * The proven robot_audio_playback backend copies PCM into a 512 KiB ring.
- * Returning an APB immediately after that copy makes FFmpeg believe the
- * hardware consumed all periods instantly, which triggers its
- * "playback underflow! pause" path.  Keep the APB owned by this lower-half
- * until its PCM duration has elapsed.
- */
 #define CONTEST_MEDIA_BYTES_PER_SEC \
   (CONTEST_MEDIA_RATE * CONTEST_MEDIA_CHANNELS * (CONTEST_MEDIA_BITS / 8))
+
+/* Pending APBs are bounded by the client's advertised six-period window.
+ * The extra slots permit orderly cancellation without allocating per APB. */
 #define CONTEST_MEDIA_PACE_QUEUE      16
-#define CONTEST_MEDIA_PACE_STACK      8192
+#ifndef CONTEST_MEDIA_PACE_STACK
+#  define CONTEST_MEDIA_PACE_STACK     8192
+#endif
 #define CONTEST_MEDIA_PACE_SLICE_US   5000
+#define CONTEST_MEDIA_HEALTH_POLL_MS  100
+#ifndef CONTEST_MEDIA_STALL_TIMEOUT_MS
+#  define CONTEST_MEDIA_STALL_TIMEOUT_MS 12000
+#endif
 
 /* Music volume is scaled only in the Media PCM bridge.  TTS uses the
  * application playback path directly and is intentionally unaffected. */
-#define CONTEST_MEDIA_MUSIC_GAIN_NUM  1
-#define CONTEST_MEDIA_MUSIC_GAIN_DEN  2
+#define CONTEST_MEDIA_MUSIC_GAIN_NUM  9
+#define CONTEST_MEDIA_MUSIC_GAIN_DEN  32
 #define CONTEST_MEDIA_GAIN_CHUNK      512
 
 /****************************************************************************
@@ -79,13 +82,17 @@
  * START/ENQUEUE return -ENOSYS instead of dereferencing a missing symbol.
  ****************************************************************************/
 
-extern int robot_audio_playback_open(void) __attribute__((weak));
+extern int robot_audio_playback_open_native_media(void) __attribute__((weak));
+extern int robot_audio_playback_start_native_media(void) __attribute__((weak));
+extern int robot_audio_playback_pause_native_media(bool paused)
+  __attribute__((weak));
+extern int robot_audio_playback_end_input(void) __attribute__((weak));
+extern int robot_audio_playback_progress(uint64_t *completed, uint64_t *pending)
+  __attribute__((weak));
 extern int robot_audio_playback_write(const uint8_t *pcm, size_t len)
   __attribute__((weak));
 extern int robot_audio_playback_finish(void) __attribute__((weak));
 extern void robot_audio_playback_close(void) __attribute__((weak));
-extern void robot_audio_playback_set_stop_on_short_underrun(bool enable)
-  __attribute__((weak));
 
 /****************************************************************************
  * Private Types
@@ -95,6 +102,7 @@ struct contest_media_pending_s
 {
   FAR struct ap_buffer_s *apb;
   size_t bytes;
+  uint64_t endpoint;
   bool final;
 };
 
@@ -104,22 +112,31 @@ struct contest_media_sink_s
   bool configured;
   bool playback_open;
   bool completion_sent;
+  bool started;
+  bool paused;
+  bool eos;
+  int stream_error;
   uint32_t sample_rate;
   uint8_t channels;
   uint8_t bits;
   size_t total_pcm;
   size_t dequeued_pcm;
+  uint32_t started_ms;
+  uint32_t last_pcm_ms;
+  uint64_t health_completed;
+  uint32_t health_progress_ms;
+  bool health_progress_valid;
   unsigned int enqueue_count;
   unsigned int dequeue_count;
   unsigned int position_query_count;
 
-  /* Media/APB pacing is deliberately separate from robot_audio_playback's
-   * own PCM ring.  The APB remains owned by this lower-half until the pacing
-   * worker returns AUDIO_CALLBACK_DEQUEUE. */
+  /* APB ownership follows the Media PCM timeline.  The copied PCM remains
+   * owned by the native playback ring until its I2S DMA completion. */
   sem_t pace_lock;
   sem_t pace_data;
   sem_t pace_empty;
   sem_t playback_lock;
+  sem_t enqueue_lock;
   pthread_t pace_worker;
   bool pace_worker_started;
   bool pace_abort;
@@ -221,6 +238,19 @@ static struct contest_media_sink_s g_contest_media_sink =
     .ops = &g_contest_media_ops,
   },
 };
+static bool g_contest_media_registered;
+
+static uint64_t contest_media_now_ms(void)
+{
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+    {
+      return 0;
+    }
+
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 
 /****************************************************************************
  * Private Functions
@@ -228,7 +258,11 @@ static struct contest_media_sink_s g_contest_media_sink =
 
 static bool contest_media_backend_available(void)
 {
-  return robot_audio_playback_open != NULL &&
+  return robot_audio_playback_open_native_media != NULL &&
+         robot_audio_playback_start_native_media != NULL &&
+         robot_audio_playback_pause_native_media != NULL &&
+         robot_audio_playback_end_input != NULL &&
+         robot_audio_playback_progress != NULL &&
          robot_audio_playback_write != NULL &&
          robot_audio_playback_finish != NULL &&
          robot_audio_playback_close != NULL;
@@ -318,34 +352,33 @@ static int contest_media_open_playback(FAR struct contest_media_sink_s *sink)
       return -ENOSYS;
     }
 
-  if (robot_audio_playback_set_stop_on_short_underrun != NULL)
-    {
-      robot_audio_playback_set_stop_on_short_underrun(true);
-    }
-
-  ret = robot_audio_playback_open();
+  ret = robot_audio_playback_open_native_media();
   if (ret < 0)
     {
-      if (robot_audio_playback_set_stop_on_short_underrun != NULL)
-        {
-          robot_audio_playback_set_stop_on_short_underrun(false);
-        }
-
       nxsem_post(&sink->playback_lock);
       syslog(LOG_ERR, "[MEDIA-BRIDGE] playback open failed=%d\n", ret);
       return ret;
     }
 
   sink->playback_open = true;
-  sink->completion_sent = false;
+  __atomic_store_n(&sink->completion_sent, false, __ATOMIC_RELEASE);
+  sink->started = false;
+  sink->paused = false;
+  sink->eos = false;
+  sink->stream_error = OK;
   sink->total_pcm = 0;
   sink->dequeued_pcm = 0;
+  __atomic_store_n(&sink->started_ms, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&sink->last_pcm_ms, 0, __ATOMIC_RELEASE);
+  sink->health_completed = 0;
+  sink->health_progress_ms = 0;
+  sink->health_progress_valid = false;
   sink->enqueue_count = 0;
   sink->dequeue_count = 0;
   sink->position_query_count = 0;
-  sink->pace_busy = false;
   sink->pace_clock_valid = false;
   sink->pace_deadline_us = 0;
+
 
   nxsem_post(&sink->playback_lock);
 
@@ -354,6 +387,44 @@ static int contest_media_open_playback(FAR struct contest_media_sink_s *sink)
          (unsigned long)sink->sample_rate,
          sink->channels, sink->bits);
   return OK;
+}
+
+/* Start the contest-local backend only from AUDIOIOC_START.  Media fills
+ * several APBs before that command; starting on the first enqueue gives the
+ * decoder an 85 ms ring and immediately triggers source-side xrun. */
+static int contest_media_start_backend(FAR struct contest_media_sink_s *sink)
+{
+  int ret;
+
+  ret = nxsem_wait_uninterruptible(&sink->playback_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (!sink->playback_open)
+    {
+      ret = -EINVAL;
+    }
+  else if (sink->started)
+    {
+      ret = OK;
+    }
+  else
+    {
+      ret = robot_audio_playback_start_native_media();
+      if (ret == OK)
+        {
+          sink->started = true;
+          sink->paused = false;
+          uint32_t now_ms = (uint32_t)contest_media_now_ms();
+          __atomic_store_n(&sink->started_ms, now_ms, __ATOMIC_RELEASE);
+          __atomic_store_n(&sink->last_pcm_ms, now_ms, __ATOMIC_RELEASE);
+        }
+    }
+
+  nxsem_post(&sink->playback_lock);
+  return ret;
 }
 
 static int contest_media_finish_playback(FAR struct contest_media_sink_s *sink,
@@ -381,17 +452,24 @@ static int contest_media_finish_playback(FAR struct contest_media_sink_s *sink,
       ret = robot_audio_playback_finish();
     }
 
+  if (robot_audio_playback_progress != NULL)
+    {
+      uint64_t completed;
+      uint64_t pending;
+
+      if (robot_audio_playback_progress(&completed, &pending) == OK)
+        {
+          sink->dequeued_pcm = completed;
+        }
+    }
+
   if (robot_audio_playback_close != NULL)
     {
       robot_audio_playback_close();
     }
 
-  if (robot_audio_playback_set_stop_on_short_underrun != NULL)
-    {
-      robot_audio_playback_set_stop_on_short_underrun(false);
-    }
-
   sink->playback_open = false;
+  sink->started = false;
   nxsem_post(&sink->playback_lock);
 
   syslog(LOG_INFO,
@@ -403,7 +481,8 @@ static int contest_media_finish_playback(FAR struct contest_media_sink_s *sink,
 }
 
 static void contest_media_dequeue(FAR struct contest_media_sink_s *sink,
-                                  FAR struct ap_buffer_s *apb)
+                                  FAR struct ap_buffer_s *apb,
+                                  uint16_t status)
 {
   if (sink->dev.upper == NULL)
     {
@@ -411,20 +490,19 @@ static void contest_media_dequeue(FAR struct contest_media_sink_s *sink,
     }
 
 #ifdef CONFIG_AUDIO_MULTI_SESSION
-  sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK, NULL);
+  sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, status,
+                  sink);
 #else
-  sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
+  sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, status);
 #endif
 }
 
 static void contest_media_complete(FAR struct contest_media_sink_s *sink)
 {
-  if (sink->completion_sent)
+  if (__atomic_exchange_n(&sink->completion_sent, true, __ATOMIC_ACQ_REL))
     {
       return;
     }
-
-  sink->completion_sent = true;
 
   if (sink->dev.upper == NULL)
     {
@@ -433,8 +511,19 @@ static void contest_media_complete(FAR struct contest_media_sink_s *sink)
 
   syslog(LOG_INFO, "[MEDIA-BRIDGE] COMPLETE\n");
 
+  if (sink->stream_error < 0)
+    {
 #ifdef CONFIG_AUDIO_MULTI_SESSION
-  sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_COMPLETE, NULL, OK, NULL);
+      sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_IOERR, NULL,
+                       (uint16_t)-sink->stream_error, sink);
+#else
+      sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_IOERR, NULL,
+                       (uint16_t)-sink->stream_error);
+#endif
+    }
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+  sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_COMPLETE, NULL, OK, sink);
 #else
   sink->dev.upper(sink->dev.priv, AUDIO_CALLBACK_COMPLETE, NULL, OK);
 #endif
@@ -454,6 +543,38 @@ static bool contest_media_pace_aborted(FAR struct contest_media_sink_s *sink)
   return aborted;
 }
 
+/* Snapshot under the lifetime lock; STOP first aborts the queue and waits
+ * for this worker, then closes the backend. No polling of a freed ring. */
+static int contest_media_progress(FAR struct contest_media_sink_s *sink,
+                                  uint64_t *completed, uint64_t *pending,
+                                  bool *started)
+{
+  int ret = nxsem_wait_uninterruptible(&sink->playback_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (started != NULL) *started = sink->started;
+  if (!sink->playback_open)
+    {
+      *completed = sink->dequeued_pcm;
+      *pending = 0;
+      ret = sink->stream_error;
+    }
+  else
+    {
+      ret = robot_audio_playback_progress(completed, pending);
+      if (ret == OK)
+        {
+          sink->dequeued_pcm = *completed;
+        }
+    }
+
+  nxsem_post(&sink->playback_lock);
+  return ret;
+}
+
 static uint64_t contest_media_now_us(void)
 {
   struct timespec ts;
@@ -467,11 +588,15 @@ static uint64_t contest_media_now_us(void)
          (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+/* Return Media APBs at the PCM consumption rate.  The native playback ring
+ * and I2S DMA continue independently; waiting for each DMA callback here
+ * starves adevsink of APBs and makes it report a false xrun after four
+ * buffers.  Use one absolute timeline so scheduler delay does not accumulate
+ * into audible gaps. */
 static void contest_media_pace_delay(FAR struct contest_media_sink_s *sink,
                                      size_t bytes)
 {
   uint64_t duration;
-  uint64_t now;
 
   if (bytes == 0)
     {
@@ -482,17 +607,7 @@ static void contest_media_pace_delay(FAR struct contest_media_sink_s *sink,
               CONTEST_MEDIA_BYTES_PER_SEC - 1) /
              CONTEST_MEDIA_BYTES_PER_SEC;
 
-  now = contest_media_now_us();
-
-  /* F7J:
-   * Do NOT implement a period as a chain of relative usleep() calls.
-   * Each sleep can overshoot slightly; adding those overshoots to the next
-   * APB makes the producer permanently slower than the 48 kB/s consumer.
-   * That was the source of the audible "word-(gap)-word-(gap)" behavior.
-   *
-   * Maintain one absolute PCM timeline instead.  Scheduler oversleep on one
-   * APB is automatically recovered by a shorter/no sleep on the next APB.
-   */
+  uint64_t now = contest_media_now_us();
   if (!sink->pace_clock_valid || now == 0)
     {
       sink->pace_deadline_us = now + duration;
@@ -505,9 +620,6 @@ static void contest_media_pace_delay(FAR struct contest_media_sink_s *sink,
 
   for (;;)
     {
-      uint64_t remain;
-      unsigned int slice;
-
       if (contest_media_pace_aborted(sink))
         {
           return;
@@ -519,11 +631,10 @@ static void contest_media_pace_delay(FAR struct contest_media_sink_s *sink,
           return;
         }
 
-      remain = sink->pace_deadline_us - now;
-      slice = remain > CONTEST_MEDIA_PACE_SLICE_US ?
-              CONTEST_MEDIA_PACE_SLICE_US :
-              (unsigned int)remain;
-
+      uint64_t remain = sink->pace_deadline_us - now;
+      unsigned int slice = remain > CONTEST_MEDIA_PACE_SLICE_US ?
+                           CONTEST_MEDIA_PACE_SLICE_US :
+                           (unsigned int)remain;
       usleep(slice);
     }
 }
@@ -556,19 +667,115 @@ static bool contest_media_pop_apb(FAR struct contest_media_sink_s *sink,
   return true;
 }
 
+/* Detect a stopped I2S DMA worker even when Media has not queued a FINAL
+ * buffer.  Without this poll, APBs already copied into the private PCM ring
+ * can be returned and the Media thread can then wait forever for an event. */
+static void contest_media_check_health(FAR struct contest_media_sink_s *sink)
+{
+  uint32_t now_ms;
+  uint32_t last_pcm_ms;
+  uint32_t started_ms;
+  uint64_t completed;
+  uint64_t pending;
+  unsigned int queued;
+  bool busy;
+  bool started;
+  bool progress_stalled;
+  bool input_stalled;
+  int ret;
+
+  if (__atomic_load_n(&sink->completion_sent, __ATOMIC_ACQUIRE) ||
+      sink->stream_error < 0 || contest_media_pace_aborted(sink))
+    {
+      return;
+    }
+
+  ret = contest_media_progress(sink, &completed, &pending, &started);
+  if (!started)
+    {
+      return;
+    }
+
+  now_ms = (uint32_t)contest_media_now_ms();
+  last_pcm_ms = __atomic_load_n(&sink->last_pcm_ms, __ATOMIC_ACQUIRE);
+  started_ms = __atomic_load_n(&sink->started_ms, __ATOMIC_ACQUIRE);
+
+  if (!sink->health_progress_valid || completed != sink->health_completed)
+    {
+      sink->health_completed = completed;
+      sink->health_progress_ms = now_ms;
+      sink->health_progress_valid = true;
+    }
+
+  if (nxsem_wait_uninterruptible(&sink->pace_lock) < 0)
+    {
+      return;
+    }
+
+  queued = sink->pace_count;
+  busy = sink->pace_busy;
+  nxsem_post(&sink->pace_lock);
+
+  progress_stalled = now_ms != 0 && sink->health_progress_valid &&
+                     (uint32_t)(now_ms - sink->health_progress_ms) >=
+                     CONTEST_MEDIA_STALL_TIMEOUT_MS;
+  input_stalled = now_ms != 0 &&
+                  (uint32_t)(now_ms - (last_pcm_ms ? last_pcm_ms :
+                                       started_ms)) >=
+                  CONTEST_MEDIA_STALL_TIMEOUT_MS;
+
+  if (ret >= 0 && !sink->eos && queued == 0 && !busy &&
+      ((pending == 0 && input_stalled) ||
+       (pending != 0 && progress_stalled)))
+    {
+      ret = -ETIMEDOUT;
+      syslog(LOG_ERR,
+             "[MEDIA-BRIDGE] no PCM input for %u ms; closing stalled stream\n",
+             CONTEST_MEDIA_STALL_TIMEOUT_MS);
+    }
+  else if (ret >= 0)
+    {
+      return;
+    }
+
+  sink->stream_error = ret;
+  sink->eos = true;
+  syslog(LOG_ERR,
+         "[MEDIA-BRIDGE] playback backend failed while streaming rc=%d; "
+         "closing and returning to caller\n", ret);
+
+  if (queued > 0)
+    {
+      /* The normal worker path returns every copied APB with the error
+       * before it emits the terminal IOERR/COMPLETE callbacks. */
+      nxsem_post(&sink->pace_data);
+      return;
+    }
+
+  (void)contest_media_finish_playback(sink, false);
+  contest_media_complete(sink);
+}
+
 static void *contest_media_pace_worker(FAR void *arg)
 {
   FAR struct contest_media_sink_s *sink = arg;
 
   syslog(LOG_INFO,
-         "[MEDIA-BRIDGE] pacer worker start rate=%uB/s queue=%u\n",
-         CONTEST_MEDIA_BYTES_PER_SEC, CONTEST_MEDIA_PACE_QUEUE);
+         "[MEDIA-BRIDGE] DMA completion worker queue=%u\n",
+         CONTEST_MEDIA_PACE_QUEUE);
 
   for (;;)
     {
       struct contest_media_pending_s entry;
 
-      if (nxsem_wait_uninterruptible(&sink->pace_data) < 0)
+      int wait_ret = nxsem_tickwait_uninterruptible(
+        &sink->pace_data, MSEC2TICK(CONTEST_MEDIA_HEALTH_POLL_MS));
+      if (wait_ret == -ETIMEDOUT || wait_ret == -ETIME)
+        {
+          contest_media_check_health(sink);
+          continue;
+        }
+      if (wait_ret < 0)
         {
           continue;
         }
@@ -576,15 +783,42 @@ static void *contest_media_pace_worker(FAR void *arg)
       while (contest_media_pop_apb(sink, &entry))
         {
           bool aborted = contest_media_pace_aborted(sink);
+          bool dma_done = false;
+          uint64_t played = 0;
+          uint64_t pending = 0;
 
-          if (!aborted)
+          int ret = aborted ? -ECANCELED : sink->stream_error;
+
+          /* Return APBs on the PCM timeline so adevsink can continuously
+           * refill its queue.  PCM was already copied into the native ring;
+           * the I2S/DMA backend owns actual speaker delivery. */
+          if (ret == OK)
             {
               contest_media_pace_delay(sink, entry.bytes);
+              if (contest_media_pace_aborted(sink))
+                {
+                  ret = -ECANCELED;
+                }
             }
 
-          contest_media_dequeue(sink, entry.apb);
+          /* Keep diagnostics tied to the real backend, while APB ownership
+           * follows the Media pacing timeline above. */
+          if (contest_media_progress(sink, &played, &pending, NULL) == OK)
+            {
+              dma_done = played >= entry.endpoint;
+            }
+
+          /* STOP can arrive while waiting. Do not turn that cancellation
+           * into natural EOS or finish()/drain the queued music. */
+          aborted = contest_media_pace_aborted(sink);
+          if (ret < 0 && !aborted)
+            {
+              sink->stream_error = ret;
+            }
+
+          contest_media_dequeue(sink, entry.apb,
+                                ret < 0 ? (uint16_t)-ret : OK);
           sink->dequeue_count++;
-          sink->dequeued_pcm += entry.bytes;
 
           if (sink->dequeue_count <= 4 ||
               (sink->dequeue_count % 32) == 0 ||
@@ -592,36 +826,46 @@ static void *contest_media_pace_worker(FAR void *arg)
             {
               syslog(LOG_INFO,
                      "[MEDIA-BRIDGE] PCM dequeue #%u bytes=%zu "
-                     "paced=%d final=%d\n",
+                     "dma_done=%d final=%d played=%zu copied=%zu\n",
                      sink->dequeue_count, entry.bytes,
-                     aborted ? 0 : 1, entry.final ? 1 : 0);
+                     dma_done ? 1 : 0, entry.final ? 1 : 0,
+                     (size_t)played, sink->total_pcm);
             }
 
-          if (entry.final && !aborted)
+          if (entry.final && !aborted && ret == OK)
             {
-              int ret;
+              int finish_ret;
 
-              /* The final APB has now lived for its PCM duration.  EOS then
-               * drains the proven robot_audio_playback ring all the way to
-               * the I2S hardware before Media receives COMPLETE. */
-              ret = contest_media_finish_playback(sink, true);
+              /* FINAL's actual samples have completed DMA. Finish joins
+               * the backend worker and closes before announcing COMPLETE. */
+              finish_ret = contest_media_finish_playback(sink, true);
+              if (finish_ret < 0) sink->stream_error = finish_ret;
               contest_media_complete(sink);
 
-              if (ret < 0)
+              if (finish_ret < 0)
                 {
                   syslog(LOG_ERR,
-                         "[MEDIA-BRIDGE] final drain failed=%d\n", ret);
+                         "[MEDIA-BRIDGE] final drain failed=%d\n", finish_ret);
                 }
             }
 
           /* Mark the APB idle only after its callback and any FINAL handling
            * have finished.  STOP waits for this flag as well as an empty
-           * queue, otherwise it can race the current pacing operation. */
+           * queue, otherwise it can race the current DMA wait operation. */
           if (nxsem_wait_uninterruptible(&sink->pace_lock) == OK)
             {
+              bool failed = sink->stream_error < 0 && !sink->pace_abort &&
+                            sink->pace_count == 0;
               sink->pace_busy = false;
               nxsem_post(&sink->pace_empty);
               nxsem_post(&sink->pace_lock);
+              if (failed)
+                {
+                  syslog(LOG_ERR, "[MEDIA-BRIDGE] DMA failed rc=%d\n",
+                         sink->stream_error);
+                  (void)contest_media_finish_playback(sink, false);
+                  contest_media_complete(sink);
+                }
             }
         }
     }
@@ -652,6 +896,7 @@ static int contest_media_queue_apb(FAR struct contest_media_sink_s *sink,
 
   sink->pending[sink->pace_tail].apb = apb;
   sink->pending[sink->pace_tail].bytes = bytes;
+  sink->pending[sink->pace_tail].endpoint = sink->total_pcm;
   sink->pending[sink->pace_tail].final = final;
   sink->pace_tail = (sink->pace_tail + 1) % CONTEST_MEDIA_PACE_QUEUE;
   sink->pace_count++;
@@ -750,6 +995,16 @@ static int contest_media_pacer_initialize(FAR struct contest_media_sink_s *sink)
       return ret;
     }
 
+  ret = nxsem_init(&sink->enqueue_lock, 0, 1);
+  if (ret < 0)
+    {
+      nxsem_destroy(&sink->playback_lock);
+      nxsem_destroy(&sink->pace_empty);
+      nxsem_destroy(&sink->pace_data);
+      nxsem_destroy(&sink->pace_lock);
+      return ret;
+    }
+
   ret = pthread_attr_init(&attr);
   if (ret != 0)
     {
@@ -778,6 +1033,7 @@ static int contest_media_pacer_initialize(FAR struct contest_media_sink_s *sink)
   return OK;
 
 fail_sems:
+  nxsem_destroy(&sink->enqueue_lock);
   nxsem_destroy(&sink->playback_lock);
   nxsem_destroy(&sink->pace_empty);
   nxsem_destroy(&sink->pace_data);
@@ -907,6 +1163,13 @@ static int contest_media_configure(FAR struct audio_lowerhalf_s *dev,
   sink->channels = channels;
   sink->bits = bits;
   sink->configured = true;
+  /* New configuration is a new stream, even after the preceding FINAL. */
+  if (!sink->playback_open)
+    {
+      __atomic_store_n(&sink->completion_sent, false, __ATOMIC_RELEASE);
+      sink->eos = false;
+      sink->stream_error = OK;
+    }
   return OK;
 }
 
@@ -937,8 +1200,15 @@ static int contest_media_start(FAR struct audio_lowerhalf_s *dev)
   (void)session;
 #endif
 
-  syslog(LOG_INFO, "[MEDIA-BRIDGE] START\n");
-  return contest_media_open_playback(sink);
+  int ret = contest_media_open_playback(sink);
+  if (ret < 0) return ret;
+  ret = contest_media_start_backend(sink);
+  if (ret == OK && sink->eos)
+    {
+      ret = robot_audio_playback_end_input();
+    }
+  syslog(LOG_INFO, "[MEDIA-BRIDGE] START DMA-backed rc=%d\n", ret);
+  return ret;
 }
 
 #ifndef CONFIG_AUDIO_EXCLUDE_STOP
@@ -965,12 +1235,12 @@ static int contest_media_stop(FAR struct audio_lowerhalf_s *dev)
    * playback ring by design, which makes a "stop" command continue playing
    * any already-buffered PCM before the device is closed.
    *
-   * First return APBs still waiting in the pacing queue, then close the
+   * First return APBs still waiting in the ownership queue, then close the
    * hardware path without draining the private PCM ring.  COMPLETE tells the
    * Media upper-half that this playback instance is terminal and permits the
    * caller to return to the normal vela> state.
    *
-   * Natural EOF remains handled by the FINAL APB / pacer path below, where
+   * Natural EOF remains handled by the FINAL APB / worker path below, where
    * robot_audio_playback_finish() is intentionally used to drain the real
    * tail before COMPLETE.
    */
@@ -991,56 +1261,22 @@ static int contest_media_pause(FAR struct audio_lowerhalf_s *dev)
 {
   FAR struct contest_media_sink_s *sink =
     (FAR struct contest_media_sink_s *)dev;
-  size_t total;
-  size_t dequeued;
-  int ret;
-
+  int ret = OK;
 #ifdef CONFIG_AUDIO_MULTI_SESSION
   (void)session;
 #endif
-
-  /*
-   * F7N EOF fallback:
-   *
-   * FFmpeg's NuttX outdev calls AUDIOIOC_PAUSE when all playback periods
-   * have returned and no partial APB remains to enqueue.  With the contest
-   * bridge this is the reliable signal we actually observe at finite-file
-   * EOF, while AUDIO_APB_FINAL / AUDIOIOC_STOP are not consistently reached
-   * by adevsink.
-   *
-   * Do NOT turn an arbitrary user pause into EOF.  Only accept this fallback
-   * when every byte submitted by Media has already reached the bridge's
-   * paced DEQUEUE point.  At that moment there is no outstanding Media PCM;
-   * robot_audio_playback may still contain its intentional 64 KiB prebuffer,
-   * and finish() will drain that real PCM before sanitizing/stopping I2S.
-   */
-  total = sink->total_pcm;
-  dequeued = sink->dequeued_pcm;
-
-  if (dequeued < total)
+  if (nxsem_wait_uninterruptible(&sink->playback_lock) < 0) return -EINTR;
+  if (sink->playback_open)
     {
-      syslog(LOG_INFO,
-             "[MEDIA-BRIDGE] PAUSE nonterminal pcm=%zu dequeued=%zu -> ignore\n",
-             total, dequeued);
-      return OK;
+      /* Media's player reports source-side xrun through AUDIOIOC_PAUSE while
+       * abufsrc has temporarily run dry.  Freezing the private I2S ring here
+       * would prevent its queued PCM from draining, block the graph writer,
+       * and make RESUME unreachable.  Keep DMA moving; empty periods are
+       * already filled with silence by the playback worker. */
+      sink->paused = true;
     }
-
-  if (!sink->playback_open)
-    {
-      syslog(LOG_INFO,
-             "[MEDIA-BRIDGE] PAUSE after completion -> ignore\n");
-      return OK;
-    }
-
-  syslog(LOG_INFO,
-         "[MEDIA-BRIDGE] PAUSE with all PCM returned -> EOF fallback "
-         "pcm=%zu dequeued=%zu\n",
-         total, dequeued);
-
-  (void)contest_media_abort_pending(sink);
-
-  ret = contest_media_finish_playback(sink, true);
-  contest_media_complete(sink);
+  nxsem_post(&sink->playback_lock);
+  /* Empty input is an underrun or a pause, never a declaration of EOF. */
   return ret;
 }
 
@@ -1058,22 +1294,20 @@ static int contest_media_resume(FAR struct audio_lowerhalf_s *dev)
   (void)session;
 #endif
 
-  /*
-   * If PAUSE was the EOF fallback above, playback is already drained and
-   * completed.  A late ff_nuttx RESUME must not reopen the hardware path.
-   * For a nonterminal pause we intentionally keep the backend running, so
-   * RESUME is also a no-op.
-   */
-  syslog(LOG_INFO,
-         "[MEDIA-BRIDGE] RESUME playback_open=%d complete=%d -> no-op\n",
-         sink->playback_open ? 1 : 0,
-         sink->completion_sent ? 1 : 0);
-  return OK;
+  int ret = OK;
+  if (nxsem_wait_uninterruptible(&sink->playback_lock) < 0) return -EINTR;
+  if (sink->playback_open)
+    {
+      ret = robot_audio_playback_pause_native_media(false);
+      if (ret == OK) sink->paused = false;
+    }
+  nxsem_post(&sink->playback_lock);
+  return ret;
 }
 #endif
 
-static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
-                                       FAR struct ap_buffer_s *apb)
+static int contest_media_enqueue_internal(FAR struct audio_lowerhalf_s *dev,
+                                          FAR struct ap_buffer_s *apb)
 {
   FAR struct contest_media_sink_s *sink =
     (FAR struct contest_media_sink_s *)dev;
@@ -1086,14 +1320,25 @@ static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
       return -EINVAL;
     }
 
-  if (sink->completion_sent && !sink->playback_open)
+  len = (size_t)apb->nbytes - (size_t)apb->curbyte;
+  final = (apb->flags & AUDIO_APB_FINAL) != 0;
+  if ((len & 1) != 0) return -EINVAL;
+  /* A bounded APB must fit before START, when DMA intentionally consumes
+   * nothing. Reject oversized client buffers rather than blocking forever. */
+  if (len > CONTEST_MEDIA_BUFFER_BYTES) return -EMSGSIZE;
+
+  if (__atomic_load_n(&sink->completion_sent, __ATOMIC_ACQUIRE) || sink->eos)
     {
-      syslog(LOG_INFO,
-             "[MEDIA-BRIDGE] drop post-COMPLETE APB bytes=%u flags=0x%x\n",
-             apb->nbytes, apb->flags);
-      contest_media_dequeue(sink, apb);
-      return OK;
+      return -EPIPE;
     }
+
+  /* Fail before committing PCM if no ownership slot is available. */
+  ret = nxsem_wait_uninterruptible(&sink->pace_lock);
+  if (ret < 0) return ret;
+  bool full = sink->pace_count + (sink->pace_busy ? 1 : 0) >=
+              CONTEST_MEDIA_PACE_QUEUE;
+  nxsem_post(&sink->pace_lock);
+  if (full) return -EAGAIN;
 
   /* Be tolerant of clients that enqueue before AUDIOIOC_START.  The NuttX
    * upper-half still requires CONFIGURE first, and open_playback() enforces
@@ -1104,37 +1349,20 @@ static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
       return ret;
     }
 
-  len = (size_t)apb->nbytes - (size_t)apb->curbyte;
-  final = (apb->flags & AUDIO_APB_FINAL) != 0;
-
-  if ((len & 1) != 0)
-    {
-      syslog(LOG_ERR, "[MEDIA-BRIDGE] odd PCM buffer len=%zu\n", len);
-      return -EINVAL;
-    }
-
   if (len > 0)
     {
       ret = contest_media_write_music_pcm(&apb->samp[apb->curbyte], len);
       if (ret < 0)
         {
-          if (ret == -EPIPE || ret == -ECANCELED)
-            {
-              syslog(LOG_INFO,
-                     "[MEDIA-BRIDGE] terminal tail ended rc=%d -> COMPLETE\n",
-                     ret);
-              contest_media_dequeue(sink, apb);
-              (void)contest_media_finish_playback(sink, false);
-              contest_media_complete(sink);
-              return OK;
-            }
-
           syslog(LOG_ERR, "[MEDIA-BRIDGE] write failed len=%zu rc=%d\n",
                  len, ret);
           return ret;
         }
 
       sink->total_pcm += len;
+      __atomic_store_n(&sink->last_pcm_ms,
+                       (uint32_t)contest_media_now_ms(),
+                       __ATOMIC_RELEASE);
       sink->enqueue_count++;
       apb->curbyte = apb->nbytes;
 
@@ -1146,15 +1374,24 @@ static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
         }
     }
 
-  /* robot_audio_playback_write() has copied the PCM, but that does NOT mean
-   * the hardware has consumed this period.  Keep ownership of the Media APB
-   * and return it later at the real 48 kB/s PCM cadence. */
+  /* Retain the APB until its PCM-duration slot on the Media timeline. */
   if (final)
     {
       syslog(LOG_INFO,
              "[MEDIA-BRIDGE] FINAL APB received bytes=%zu "
              "pcm_total=%zu dequeued=%zu\n",
              len, sink->total_pcm, sink->dequeued_pcm);
+    }
+
+  if (final)
+    {
+      sink->eos = true;
+      /* Nonblocking EOS wakes even a file shorter than the startup water
+       * mark. Waiting for FINAL's dequeue before EOS would deadlock. */
+      if (nxsem_wait_uninterruptible(&sink->playback_lock) < 0) return -EINTR;
+      ret = sink->started ? robot_audio_playback_end_input() : OK;
+      nxsem_post(&sink->playback_lock);
+      if (ret < 0) return ret;
     }
 
   ret = contest_media_queue_apb(sink, apb, len, final);
@@ -1167,6 +1404,17 @@ static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
     }
 
   return OK;
+}
+
+static int contest_media_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
+                                       FAR struct ap_buffer_s *apb)
+{
+  FAR struct contest_media_sink_s *sink = (FAR void *)dev;
+  int ret = nxsem_wait_uninterruptible(&sink->enqueue_lock);
+  if (ret < 0) return ret;
+  ret = contest_media_enqueue_internal(dev, apb);
+  nxsem_post(&sink->enqueue_lock);
+  return ret;
 }
 
 static int contest_media_ioctl(FAR struct audio_lowerhalf_s *dev,
@@ -1196,8 +1444,8 @@ static int contest_media_ioctl(FAR struct audio_lowerhalf_s *dev,
         }
 
       case AUDIOIOC_SETBUFFERINFO:
-        /* The playback backend owns its own 256 KiB ring and DMA geometry,
-         * so Media's requested APB geometry does not need to alter it. */
+        /* GETBUFFERINFO is authoritative: the native playback ring and DMA
+         * geometry are private to the backend, not set by a Media period. */
         return OK;
 
       case AUDIOIOC_GETPOSITION:
@@ -1220,30 +1468,11 @@ static int contest_media_ioctl(FAR struct audio_lowerhalf_s *dev,
                 CONTEST_MEDIA_CHANNELS * (CONTEST_MEDIA_BITS / 8);
             }
 
-          /*
-           * F7L:
-           *
-           * FFmpeg's AV_APP_TO_DEV_DRAIN explicitly calls
-           * AUDIOIOC_GETPOSITION first and refuses to send its final
-           * zero-byte AUDIO_APB_FINAL buffer if GETPOSITION fails.
-           *
-           * The bridge's paced DEQUEUE callback is our approximation of
-           * hardware consumption time, so report the number of PCM sample
-           * frames whose APBs have reached that point.
-           */
-          *position = (long)(sink->dequeued_pcm / bytes_per_frame);
-          sink->position_query_count++;
-
-          if (sink->position_query_count <= 4 ||
-              (sink->position_query_count % 32) == 0)
-            {
-              syslog(LOG_INFO,
-                     "[MEDIA-BRIDGE] GETPOSITION samples=%ld "
-                     "dequeued_pcm=%zu query=%u\n",
-                     *position, sink->dequeued_pcm,
-                     sink->position_query_count);
-            }
-
+          uint64_t completed;
+          uint64_t pending;
+          int ret = contest_media_progress(sink, &completed, &pending, NULL);
+          if (ret < 0) return ret;
+          *position = (long)(completed / bytes_per_frame);
           return OK;
         }
 
@@ -1257,18 +1486,49 @@ static int contest_media_ioctl(FAR struct audio_lowerhalf_s *dev,
               return -EINVAL;
             }
 
-          /*
-           * APB completion is already paced against CLOCK_MONOTONIC, so do
-           * not ask FFmpeg to add another synthetic lower-half latency.
-           */
-          *latency = 0;
+          uint64_t completed;
+          uint64_t pending;
+          int ret = contest_media_progress(sink, &completed, &pending, NULL);
+          if (ret < 0) return ret;
+          *latency = (long)(pending / (CONTEST_MEDIA_CHANNELS *
+                                      (CONTEST_MEDIA_BITS / 8)));
           return OK;
         }
 
       case AUDIOIOC_FLUSH:
-        syslog(LOG_INFO, "[MEDIA-BRIDGE] FLUSH\n");
-        (void)contest_media_abort_pending(sink);
-        return contest_media_finish_playback(sink, false);
+        {
+          bool restart = sink->started;
+#ifndef CONFIG_AUDIO_EXCLUDE_PAUSE_RESUME
+          bool paused = sink->paused;
+#endif
+          syslog(LOG_INFO, "[MEDIA-BRIDGE] FLUSH\n");
+          (void)contest_media_abort_pending(sink);
+          int ret = contest_media_finish_playback(sink, false);
+          sink->eos = false;
+          __atomic_store_n(&sink->completion_sent, false, __ATOMIC_RELEASE);
+          sink->stream_error = OK;
+          /* ff_nuttx_flush() keeps its running flag. Re-arm the lower half
+           * here; the client will not send a new START after a seek/flush. */
+          if (ret == OK && restart)
+            {
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+              ret = contest_media_start(dev, sink);
+#else
+              ret = contest_media_start(dev);
+#endif
+#ifndef CONFIG_AUDIO_EXCLUDE_PAUSE_RESUME
+              if (ret == OK && paused)
+                {
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+                  ret = contest_media_pause(dev, sink);
+#else
+                  ret = contest_media_pause(dev);
+#endif
+                }
+#endif
+            }
+          return ret;
+        }
 
       default:
         return -ENOTTY;
@@ -1322,12 +1582,15 @@ int board_voice_audio_initialize(void)
     defined(CONFIG_CONTEST_BOARD_I2S1_TX)
   int ret;
 
+  if (g_contest_media_registered) return OK;
+
   /* I2S1 itself is initialized immediately before this function by
    * contest_board_bringup().  Do not create a second audio_i2s owner here:
    * robot_audio_playback will acquire the existing board I2S instance when
    * Media actually starts playback. */
 
-  ret = contest_media_pacer_initialize(&g_contest_media_sink);
+  ret = g_contest_media_sink.pace_worker_started ? OK :
+        contest_media_pacer_initialize(&g_contest_media_sink);
   if (ret < 0)
     {
       syslog(LOG_ERR, "[MEDIA-BRIDGE] pacer init failed: %d\n", ret);
@@ -1341,9 +1604,11 @@ int board_voice_audio_initialize(void)
       return ret;
     }
 
+  g_contest_media_registered = true;
+
   syslog(LOG_INFO,
          "[MEDIA-BRIDGE] registered /dev/audio/pcm0p "
-         "route=Media->robot_audio_playback "
+         "route=Media->DMA-progress-v11 "
          "format=%uHz/%uch/%ubit backend=%s\n",
          CONTEST_MEDIA_RATE, CONTEST_MEDIA_CHANNELS, CONTEST_MEDIA_BITS,
          contest_media_backend_available() ? "ready" : "missing");

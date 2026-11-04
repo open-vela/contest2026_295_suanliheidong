@@ -17,6 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <infra/network_manager.h>
+
 #include "robot_oled.h"
 #include "robot_oled_expr.h"
 
@@ -36,6 +38,7 @@ extern struct lcd_dev_s *board_oled_getdev(void);
 #define ROBOT_OLED_QUEUE_DEPTH        8
 #define ROBOT_OLED_STACK              8192
 #define ROBOT_OLED_ANIMATION_TICK_MS  200
+#define ROBOT_OLED_STATUS_REFRESH_MS  1000
 
 /*
  * The panel bring-up test has already passed.  Keep the destructive ALL ON /
@@ -71,6 +74,7 @@ static bool g_oled_thread_valid;
 static bool g_oled_ready;
 static bool g_oled_failed;
 static bool g_oled_stop;
+static bool g_oled_loading;
 
 static void robot_oled_mark_failed(const char *stage, int ret)
 {
@@ -116,12 +120,14 @@ static int robot_oled_fill(bool on)
 }
 
 static int robot_oled_render(enum robot_expression_e expression,
-                             unsigned int animation_frame)
+                             unsigned int animation_frame,
+                             bool wifi_connected, bool loading)
 {
   uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES];
 
   memset(frame, 0, sizeof(frame));
   robot_oled_render_expression_frame(expression, animation_frame, frame);
+  robot_oled_render_status(frame, wifi_connected, loading, animation_frame);
   return robot_oled_flush_frame(frame);
 }
 
@@ -143,6 +149,10 @@ static void *robot_oled_worker(void *arg)
   enum robot_expression_e current_expression = ROBOT_EXPRESSION_IDLE;
   unsigned int animation_tick = 0;
   unsigned int current_frame = 0;
+  unsigned long long next_status_refresh_ms;
+  bool last_wifi_connected = false;
+  bool last_loading = false;
+  bool have_status = false;
   bool have_current = false;
   int ret;
 
@@ -220,12 +230,18 @@ static void *robot_oled_worker(void *arg)
          ROBOT_OLED_WIDTH, ROBOT_OLED_HEIGHT,
          (unsigned int)ROBOT_OLED_ANIMATION_TICK_MS);
 
+  next_status_refresh_ms = 0;
+
   for (;;)
     {
       enum robot_expression_e expression = current_expression;
       unsigned int frame = current_frame;
       bool render_now = false;
       bool state_change = false;
+      bool wifi_connected;
+      bool loading;
+      struct timespec now;
+      unsigned long long now_ms;
 
       pthread_mutex_lock(&g_oled_queue.lock);
       while (g_oled_queue.count == 0 && !g_oled_stop)
@@ -247,6 +263,8 @@ static void *robot_oled_worker(void *arg)
           pthread_mutex_unlock(&g_oled_queue.lock);
           break;
         }
+
+      loading = g_oled_loading;
 
       if (g_oled_queue.count > 0)
         {
@@ -283,12 +301,36 @@ static void *robot_oled_worker(void *arg)
 
       pthread_mutex_unlock(&g_oled_queue.lock);
 
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      now_ms = (unsigned long long)now.tv_sec * 1000ull +
+               (unsigned long long)now.tv_nsec / 1000000ull;
+      wifi_connected = network_is_connected();
+      if (have_current && (!have_status ||
+                           wifi_connected != last_wifi_connected ||
+                           loading != last_loading))
+        {
+          render_now = true;
+        }
+      if (have_current)
+        {
+          last_wifi_connected = wifi_connected;
+          last_loading = loading;
+          have_status = true;
+        }
+      if (have_current && now_ms >= next_status_refresh_ms)
+        {
+          render_now = true;
+          expression = current_expression;
+          frame = current_frame;
+          next_status_refresh_ms = now_ms + ROBOT_OLED_STATUS_REFRESH_MS;
+        }
+
       if (!render_now)
         {
           continue;
         }
 
-      ret = robot_oled_render(expression, frame);
+      ret = robot_oled_render(expression, frame, wifi_connected, loading);
       if (ret < 0)
         {
           robot_oled_mark_failed("render", ret);
@@ -381,6 +423,7 @@ int robot_oled_stop(void)
   g_oled_queue.head = 0;
   g_oled_queue.tail = 0;
   g_oled_queue.count = 0;
+  g_oled_loading = false;
   pthread_mutex_unlock(&g_oled_queue.lock);
 
   g_oled_dev = NULL;
@@ -445,6 +488,18 @@ int robot_oled_submit(enum robot_expression_e expression)
          expression, g_oled_queue.count, g_oled_ready ? 1 : 0);
 
   pthread_cond_signal(&g_oled_queue.available);
+  pthread_mutex_unlock(&g_oled_queue.lock);
+  return 0;
+}
+
+int robot_oled_set_loading(bool loading)
+{
+  pthread_mutex_lock(&g_oled_queue.lock);
+  g_oled_loading = loading;
+  if (g_oled_initialized && !g_oled_stop)
+    {
+      pthread_cond_signal(&g_oled_queue.available);
+    }
   pthread_mutex_unlock(&g_oled_queue.lock);
   return 0;
 }

@@ -154,7 +154,9 @@ static int robotctl_single_servo(int argc, char *argv[])
 
   printf("robotctl: move %s %d -> %d\n", robotctl_servo_name(servo),
          ctx.angle[servo], angle);
-  ret = robotctl_servo_move_one(&ctx, servo, angle, 30, 200);
+  ret = robotctl_servo_move_one(
+    &ctx, servo, angle,
+    robot_motion_limb_interval(ROBOT_MOTION_DEFAULT_WALK_PERIOD), 200);
   robotctl_servo_close(&ctx);
   return ret;
 }

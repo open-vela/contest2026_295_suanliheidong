@@ -1,134 +1,81 @@
 # Robot Meal Companion
 
-Use this Skill for proactive meal reminders, restaurant/takeaway suggestions,
-fitness-oriented food planning, and user-selected low-GI eating preferences.
+<!-- contest-skill: role=domain, source=contest, official-fallback=none -->
 
-## What the local service provides
-
-The contest-local service exposes:
-
-- `robot_wellness_profile`
-- `robot_meal_context`
-
-`robot_meal_context` returns an explainable `workload_score` based on Feishu
-messages that actually entered this AI Agent. It is a work-density/task signal,
-not a diagnosis of stress, anxiety, burnout, diabetes, or any other condition.
-
-The service does not retain complete Feishu message bodies. It keeps only
-timestamps and small task/urgency counters.
+Contest's single meal and food skill. It combines food recommendations,
+fitness-oriented meal planning, Feishu workload context, and explicit meal
+reminders. Do not invoke a second meal or food skill.
 
 ## When to use
 
-Use this Skill when:
+Use for:
 
-- the user asks what to eat;
-- the user asks for fitness, muscle-gain, fat-loss, high-protein, or low-GI
-  meal ideas;
-- the user asks to enable/disable proactive meal reminders;
-- a message starts with `[ROBOT_WELLNESS_EVENT]`.
+- what to eat, restaurant or takeaway suggestions;
+- balanced, fat-loss, muscle-gain, high-protein, or low-GI meal planning;
+- explicit meal, hydration, or exercise reminders;
+- `[ROBOT_WELLNESS_EVENT]`;
+- legacy `[ROBOT_INTERNAL_EVENT]` events with
+  `type=meal_recommendation_due`.
 
-## Proactive event procedure
+## Recommendation flow
 
-For `[ROBOT_WELLNESS_EVENT]`:
+1. Reuse location, dietary restrictions, budget, and preferences already in
+   the conversation.
+2. If a nearby or current recommendation needs location and it is missing, ask
+   only for the city, district, or nearby landmark.
+3. Once location is known, use an available map/POI tool; otherwise call
+   `web_search` with the location, meal, and preference.
+4. Give one to three practical options. State only information returned by a
+   tool; never invent restaurant names, prices, opening status, or availability.
+5. Ask at most one preference question before recommending. Stop asking once
+   there is enough information.
 
-1. Call `robot_meal_context`.
-2. Read:
-   - meal;
-   - workload_score and evidence;
-   - diet_goal;
-   - location_hint;
-   - preference_note.
-3. If `location_hint` is present:
-   - prefer an available nearby POI/map MCP Tool (for example an installed
-     Amap/地图 MCP) when available;
-   - otherwise use `web_search` with the location, meal, and diet preference.
-4. Recommend about 3 practical options.
-5. Keep the reply concise and caring.
-6. Never place an order automatically.
-7. Never claim that workload_score is a mental-health diagnosis.
-
-If location is missing, ask for the city/district or nearby area rather than
-guessing.
+For voice/TTS, use one or two short sentences per turn.
 
 ## Diet guidance
 
-### balanced
+- `balanced`: vegetables, a clear protein source, and a reasonable staple.
+- `fat_loss`: adequate protein and vegetables; moderate staple portions; no
+  promises about weight loss from one meal.
+- `muscle_gain`: protein, carbohydrate, vegetables, and enough fluids.
+- `high_protein`: fish, chicken, eggs, tofu/beans, lean meat, or an equivalent
+  verified option.
+- `low_gi`: prefer vegetables, legumes, less-refined staples, protein, and
+  unsweetened drinks. Do not invent numeric GI values or infer diabetes.
 
-Prefer a normal mixed meal with vegetables, protein, and a reasonable staple.
+Treat allergies and intolerances as strict constraints. Do not diagnose, give
+medication advice, or place an order automatically.
 
-### fat_loss
+## Wellness events
 
-Prefer vegetables, adequate protein, moderate staple portions, and avoid
-framing a single meal as a guarantee of weight loss.
+For `[ROBOT_WELLNESS_EVENT]`, call `robot_meal_context` and use only its
+`meal`, `workload_score`, `evidence`, `diet_goal`, `location_hint`, and
+`preference_note` fields when present. `workload_score` is a work-density
+signal, not a mental-health diagnosis. Do not quote Feishu message bodies.
 
-### muscle_gain
+For a legacy meal event, use its meal, local time, and `event_id`; do not repeat
+an event, wake outside its configured window, or create a reminder unless the
+user explicitly requested one.
 
-Prefer a clear protein source plus staple carbohydrate and vegetables.
+## Reminders
 
-### high_protein
+Create a reminder only when the user asks for one.
 
-Prefer meals with an obvious protein source such as fish, chicken, eggs,
-tofu/beans, lean meat, or equivalent foods.
+1. Call `get_current_time` when the target timestamp must be calculated.
+2. Call `cron_add` with a short name, an integer `at_epoch` for a one-time
+   reminder, or `interval_s` for an explicitly recurring reminder.
+3. Use the current channel and chat context supplied by the runtime; never
+   invent a Feishu `chat_id`.
+4. Confirm only after `cron_add` succeeds. Use `cron_list` to inspect and
+   `cron_remove` to cancel an existing reminder.
 
-### low_gi
+The reminder text must be self-contained and must not expose private work
+messages.
 
-Treat `low_gi` as the user's chosen food preference.
+## Proactive profile
 
-Prefer, when available:
-
-- vegetables;
-- legumes;
-- whole grains or less-refined staples;
-- adequate protein;
-- unsweetened drinks.
-
-Do not invent a numeric GI value for a restaurant dish. Only state a numeric
-GI if a reliable retrieved source actually supports that number.
-
-Do not infer diabetes from a low-GI preference and do not describe the meal as
-medical treatment.
-
-## Enabling proactive reminders
-
-When the user explicitly asks to enable proactive meal reminders from the
-intended Feishu conversation, call:
-
-`robot_wellness_profile`
-
-with:
-
-- `action = "enable"`
-- `bind_last_feishu_chat = true`
-
-This binds proactive replies to the most recently observed Feishu chat.
-
-The user may configure:
-
-- `goal`
-- `location_hint`
-- `preference_note`
-- `busy_only`
-- `workload_threshold`
-
-Default behavior should be conservative: proactive reminders are disabled until
-the user explicitly enables them.
-
-## Privacy
-
-Do not quote or expose work-message contents in a meal recommendation.
-
-It is fine to say:
-
-> Your recent Feishu work-message density is relatively high.
-
-Do not say:
-
-> Colleague X told you Project Y is late, so you are stressed.
-
-unless the user explicitly asks to discuss that message and it is present in
-the current conversation.
-
-## Important limitation
-
-This feature observes only Feishu messages that are delivered into this
-AI Agent's message bus. It is not a full-company Feishu inbox monitor.
+To enable proactive meal reminders, call `robot_wellness_profile` with
+`action="enable"` and `bind_last_feishu_chat=true`. Keep proactive reminders
+disabled until the user explicitly enables them. The optional profile fields
+are `goal`, `location_hint`, `preference_note`, `busy_only`, and
+`workload_threshold`.

@@ -1,3 +1,4 @@
+#include "robot_voice_diag.h"
 #include <nuttx/config.h>
 
 #include <errno.h>
@@ -28,9 +29,9 @@
 #define ROBOT_MUSIC_PATH_MAX         256
 #define ROBOT_MUSIC_WORKER_STACK     (16 * 1024)
 
-/* Music software gain: 1/2 amplitude ~= -6.02 dB. */
-#define ROBOT_MUSIC_GAIN_NUM          1
-#define ROBOT_MUSIC_GAIN_DEN          2
+/* Music software gain: 9/32 amplitude ~= -10.88 dB. */
+#define ROBOT_MUSIC_GAIN_NUM          9
+#define ROBOT_MUSIC_GAIN_DEN          32
 
 struct robot_music_job_s
 {
@@ -45,7 +46,7 @@ static bool g_robot_music_tool_registered;
 static char g_robot_music_path[ROBOT_MUSIC_PATH_MAX];
 static int g_robot_music_last_result;
 
-/* robot_media_player.c provides this when the official Media path is linked. */
+/* robot_music_media.c provides the native OpenVela Media stop hook. */
 extern int robot_media_stop_active(void) __attribute__((weak));
 
 static bool robot_music_stop_requested(void)
@@ -154,7 +155,7 @@ int robot_music_play_file(const char *path)
       return -EINVAL;
     }
 
-  printf("[ROBOT-MUSIC] source=%s\n", path);
+  RV_VERBOSE("[ROBOT-MUSIC] source=%s\n", path);
 
   fd = open(path, O_RDONLY);
   if (fd < 0)
@@ -221,7 +222,7 @@ int robot_music_play_file(const char *path)
 
           if (chunk_size < sizeof(fmt))
             {
-              printf("[ROBOT-MUSIC] invalid fmt chunk size=%lu\n",
+              RV_VERBOSE("[ROBOT-MUSIC] invalid fmt chunk size=%lu\n",
                      (unsigned long)chunk_size);
               ret = -EINVAL;
               goto out;
@@ -279,7 +280,7 @@ int robot_music_play_file(const char *path)
       goto out;
     }
 
-  printf("[ROBOT-MUSIC] PCM format=%u channels=%u rate=%lu bits=%u "
+  RV_VERBOSE("[ROBOT-MUSIC] PCM format=%u channels=%u rate=%lu bits=%u "
          "data_bytes=%lu\n",
          audio_format, channels, (unsigned long)sample_rate,
          bits_per_sample, (unsigned long)data_bytes);
@@ -296,7 +297,7 @@ int robot_music_play_file(const char *path)
 
   if ((data_bytes & 1u) != 0)
     {
-      printf("[ROBOT-MUSIC] invalid odd PCM data size=%lu\n",
+      RV_VERBOSE("[ROBOT-MUSIC] invalid odd PCM data size=%lu\n",
              (unsigned long)data_bytes);
       ret = -EINVAL;
       goto out;
@@ -326,7 +327,7 @@ int robot_music_play_file(const char *path)
       music_expression_set = true;
     }
 
-  printf("[ROBOT-MUSIC] playback start via robot_audio_playback\n");
+  RV_VERBOSE("[ROBOT-MUSIC] playback start via robot_audio_playback\n");
 
   {
     uint32_t remaining = data_bytes;
@@ -338,7 +339,7 @@ int robot_music_play_file(const char *path)
 
         if (robot_music_stop_requested())
           {
-            printf("[ROBOT-MUSIC] stop observed before next PCM chunk\n");
+            RV_VERBOSE("[ROBOT-MUSIC] stop observed before next PCM chunk\n");
             break;
           }
 
@@ -368,7 +369,7 @@ int robot_music_play_file(const char *path)
         if (((size_t)nread & 1u) != 0)
           {
             ret = -EIO;
-            printf("[ROBOT-MUSIC] odd PCM read bytes=%ld\n", (long)nread);
+            RV_VERBOSE("[ROBOT-MUSIC] odd PCM read bytes=%ld\n", (long)nread);
             break;
           }
 
@@ -395,11 +396,11 @@ int robot_music_play_file(const char *path)
   else if (robot_music_stop_requested())
     {
       /* Immediate user stop: close playback without draining queued music. */
-      printf("[ROBOT-MUSIC] playback stopped by request\n");
+      RV_VERBOSE("[ROBOT-MUSIC] playback stopped by request\n");
       ret = 0;
     }
 
-  printf("[ROBOT-MUSIC] playback done rc=%d\n", ret);
+  RV_VERBOSE("[ROBOT-MUSIC] playback done rc=%d\n", ret);
 
 out:
   if (music_expression_set)
@@ -440,7 +441,7 @@ static void *robot_music_worker(void *arg)
       return NULL;
     }
 
-  printf("[ROBOT-MUSIC] worker start path=%s\n", job->path);
+  RV_VERBOSE("[ROBOT-MUSIC] worker start path=%s\n", job->path);
   ret = robot_music_play_file(job->path);
 
   pthread_mutex_lock(&g_robot_music_lock);
@@ -451,7 +452,7 @@ static void *robot_music_worker(void *arg)
   pthread_cond_broadcast(&g_robot_music_cond);
   pthread_mutex_unlock(&g_robot_music_lock);
 
-  printf("[ROBOT-MUSIC] worker done rc=%d\n", ret);
+  RV_VERBOSE("[ROBOT-MUSIC] worker done rc=%d\n", ret);
   free(job);
   return NULL;
 }
@@ -467,7 +468,7 @@ int robot_music_stop(void)
   if (local_active)
     {
       g_robot_music_stop_requested = true;
-      printf("[ROBOT-MUSIC] stop requested path=%s\n", g_robot_music_path);
+      RV_VERBOSE("[ROBOT-MUSIC] stop requested path=%s\n", g_robot_music_path);
     }
   pthread_mutex_unlock(&g_robot_music_lock);
 
@@ -500,7 +501,7 @@ int robot_music_stop(void)
       usleep(20 * 1000);
     }
 
-  printf("[ROBOT-MUSIC] stop complete media_rc=%d\n", media_ret);
+  RV_VERBOSE("[ROBOT-MUSIC] stop complete media_rc=%d\n", media_ret);
   return media_ret < 0 ? media_ret : 0;
 }
 
@@ -705,7 +706,7 @@ static int robot_music_tool_execute(const char *name,
   snprintf(output, output_size,
            "{\"ok\":true,\"state\":\"PLAYING\",\"path\":\"%s\","
            "\"backend\":\"robot_audio_playback\"}", path);
-  printf("[ROBOT-MUSIC] Tool started path=%s\n", path);
+  RV_VERBOSE("[ROBOT-MUSIC] Tool started path=%s\n", path);
   return OK;
 }
 
@@ -725,7 +726,7 @@ int robot_music_register_tool(void)
   tool_registry_invalidate();
   g_robot_music_tool_registered = true;
 
-  printf("[ROBOT-MUSIC] Tool registered name=%s default=%s\n",
+  RV_VERBOSE("[ROBOT-MUSIC] Tool registered name=%s default=%s\n",
          ROBOT_MUSIC_TOOL_NAME, ROBOT_MUSIC_DEFAULT_PATH);
   return 0;
 }

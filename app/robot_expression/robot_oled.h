@@ -17,6 +17,8 @@ extern "C"
 int robot_oled_init(void);
 int robot_oled_stop(void);
 int robot_oled_submit(enum robot_expression_e expression);
+/* Show or clear the generic LOAD indicator without replacing the face. */
+int robot_oled_set_loading(bool loading);
 bool robot_oled_is_available(void);
 
 #ifdef __cplusplus

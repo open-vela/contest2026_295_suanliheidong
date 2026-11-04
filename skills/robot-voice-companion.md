@@ -1,5 +1,7 @@
 # Robot Voice Companion
 
+<!-- contest-skill: role=router, source=contest, runtime=voice-reply -->
+
 Use this Skill whenever the current interaction is a voice conversation or the
 final answer will be played by TTS.
 

@@ -1,0 +1,2 @@
+# Portable AFE compilation units (no external DSP installation).
+ROBOT_AFE_SRCS := robot_voice_afe.c robot_afe_vad_fvad.c robot_afe_vad_division_operations.c robot_afe_vad_energy.c robot_afe_vad_get_scaling_square.c robot_afe_vad_resample_48khz.c robot_afe_vad_resample_by_2_internal.c robot_afe_vad_resample_fractional.c robot_afe_vad_spl_inl.c robot_afe_vad_vad_core.c robot_afe_vad_vad_filterbank.c robot_afe_vad_vad_gmm.c robot_afe_vad_vad_sp.c

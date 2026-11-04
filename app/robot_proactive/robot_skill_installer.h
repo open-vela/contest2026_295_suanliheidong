@@ -23,6 +23,8 @@ enum robot_skill_install_result_e
 };
 
 int robot_skill_installer_ensure(void);
+bool robot_skill_installer_music_ready(void);
+bool robot_skill_installer_companion_ready(void);
 size_t robot_skill_installer_count(void);
 size_t robot_skill_installer_current_count(void);
 size_t robot_skill_installer_created_count(void);

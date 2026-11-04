@@ -33,6 +33,13 @@ struct robot_world_state_s
   bool idle_event_fired;
   bool idle_event_pending;
   bool music_playing;
+  bool power_risk;
+  uint32_t music_session_id;
+  uint32_t music_event_id;
+  uint32_t last_music_event_id;
+  uint32_t music_tail_session_id;
+  uint32_t music_react_session_id;
+  uint64_t last_music_tail_ms;
   uint16_t music_tempo_bpm;
   char music_track[64];
   char music_category[32];
@@ -55,7 +62,17 @@ struct robot_world_state_s
   uint32_t last_processed_event_id;
 };
 
+#define ROBOT_MUSIC_TAIL_COOLDOWN_MS 400ULL
 int robot_world_state_init(void);
+/* A board voltage/reset monitor may latch risk; it is not a voltage sensor. */
+void robot_world_state_set_power_risk(bool risk);
+int robot_world_state_update_music_session(enum robot_music_state_e state,
+  uint32_t session_id, const char *track, const char *category,
+  const char *mood, uint16_t tempo_bpm, bool *changed);
+void robot_world_state_arm_music_event(uint32_t session_id, uint32_t event_id);
+int robot_world_state_claim_music_reaction(uint32_t session_id, uint32_t event_id);
+int robot_world_state_claim_music_tail(uint32_t session_id, uint32_t event_id);
+int robot_world_state_claim_music_tail_repeat(uint32_t session_id, uint32_t event_id);
 void robot_world_state_set_enabled(bool enabled);
 void robot_world_state_note_user_activity(void);
 void robot_world_state_set_conversation_active(bool active);

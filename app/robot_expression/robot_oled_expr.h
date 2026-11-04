@@ -7,6 +7,7 @@
 #ifndef __CONTEST_ROBOT_OLED_EXPR_H
 #define __CONTEST_ROBOT_OLED_EXPR_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "robot_expression.h"
@@ -29,6 +30,11 @@ unsigned int robot_oled_animation_frame(enum robot_expression_e expression,
 void robot_oled_render_expression_frame(
     enum robot_expression_e expression, unsigned int animation_frame,
     uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES]);
+
+/* Overlay the Wi-Fi indicator and a compact loading marker. */
+void robot_oled_render_status(
+    uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES],
+    bool wifi_connected, bool loading, unsigned int loading_frame);
 
 /* Compatibility wrapper: render the first frame of an expression. */
 void robot_oled_render_expression(enum robot_expression_e expression,

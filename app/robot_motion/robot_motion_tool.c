@@ -19,10 +19,17 @@
 #include "robot_action_guard.h"
 #include "robot_motion.h"
 #include "robot_motion_tool.h"
+#include "robot_voice_wifi.h"
 #include "robot_world_state.h"
+#include <stdint.h>
+extern bool robot_music_media_is_active(void) __attribute__((weak));
 
 #define ROBOT_MOTION_TOOL_NAME "robot_move"
 #define ROBOT_TAIL_WAG_TOOL_NAME "robot_tail_wag"
+#define ROBOT_MUSIC_REACT_TOOL_NAME "robot_music_react"
+#define ROBOT_MUSIC_COMPANION_TOOL_NAME "robot_music_companion"
+extern int robot_music_media_companion_start(uint32_t, uint32_t, bool, bool);
+extern int robot_music_media_react(uint32_t, uint32_t, bool);
 
 static bool g_robot_motion_tool_registered;
 
@@ -58,14 +65,37 @@ static char *robot_motion_tool_get_tools(void)
     "{\"name\":\"robot_tail_wag\","
     "\"description\":\"" ROBOT_SIDE_EFFECT_TOOL_POLICY
     "Make the robot dog wag its tail using a brownout-aware low-current soft-ramp "
-    "profile. Prefer the defaults, especially during music or TTS. The "
+    "profile. Prefer the defaults, during music, supply the current music_session_id and event_id tokens. The "
     "motion uses tiny segmented steps with recovery gaps and returns to "
     "center. Do not invent servo angles or request aggressive settings.\","
     "\"input_schema\":{\"type\":\"object\",\"properties\":{"
-    "\"cycles\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2},"
-    "\"amplitude_deg\":{\"type\":\"integer\",\"minimum\":3,\"maximum\":20},"
-    "\"period_ms\":{\"type\":\"integer\",\"minimum\":2600,\"maximum\":3000}},"
-    "\"required\":[]}}]";
+    "\"cycles\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1,\"default\":1},"
+    "\"amplitude_deg\":{\"type\":\"integer\",\"minimum\":3,\"maximum\":6,\"default\":3},"
+    "\"period_ms\":{\"type\":\"integer\",\"minimum\":4500,\"maximum\":6000,\"default\":5400},"
+    "\"music_session_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295},"
+    "\"event_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295}},"
+    "\"required\":[]}},"
+    "{\"name\":\"robot_music_react\",\"description\":\""
+    "Event-scoped music expression. For confirmed robot-music-companion events "
+    "use this tool once instead of generic robot_react. Requires current "
+    "music_session_id and event_id; stale or duplicate events are skipped.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{"
+    "\"reaction\":{\"type\":\"string\",\"enum\":[\"happy\",\"listening\"]},"
+    "\"music_session_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295},"
+    "\"event_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295}},"
+    "\"required\":[\"music_session_id\",\"event_id\"]}},"
+    "{\"name\":\"robot_music_companion\",\"description\":\""
+    "Enable the local companion policy for the entire confirmed music session. "
+    "The playback runtime already enables this policy after DMA confirmation. "
+    "It uses the singing face animation and a 3-degree tail step every 1000 ms "
+    "when audio and power allow. It retries safety skips locally, stops with "
+    "music, and makes no further LLM, TTS or music requests.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{"
+    "\"style\":{\"type\":\"string\",\"enum\":[\"playful\",\"calm\"],\"default\":\"playful\"},"
+    "\"tail\":{\"type\":\"string\",\"enum\":[\"on\",\"off\"],\"default\":\"on\"},"
+    "\"music_session_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295},"
+    "\"event_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295}},"
+    "\"required\":[\"music_session_id\",\"event_id\"]}}]";
 
   printf("[ROBOT-MOTION-TOOL] tools_json requested\n");
   return strdup(tools_json);
@@ -83,7 +113,8 @@ static int robot_motion_tool_number(cJSON *item, unsigned int minimum,
     }
 
   number = item->valuedouble;
-  if (number < minimum || number > maximum || number != (double)(int)number)
+  if (!(number >= minimum && number <= maximum) ||
+      number != (double)(unsigned int)number)
     {
       return -EINVAL;
     }
@@ -170,14 +201,49 @@ static int robot_motion_tool_execute_move(const char *name,
          direction_name, steps, period_ms);
   direction_name = robot_motion_direction_name(direction);
   cJSON_Delete(root);
+
+  ret = robot_voice_wifi_ensure_connected(0);
+  if (ret < 0)
+    {
+      snprintf(output, output_size,
+               "{\"ok\":false,\"error\":\"network unavailable\","
+               "\"rc\":%d}", ret);
+      printf("[POWER-SAFE] mono_ms=%llu MOVE_TOOL_RETURN rc=%d\n",
+             robot_motion_tool_now_ms(), ret);
+      return ERROR;
+    }
+
   robot_action_guard_begin(ROBOT_ACTION_MOTION, ROBOT_MOTION_TOOL_NAME);
-  robot_world_state_set_motion_active(true);
   ret = robot_motion_submit_and_wait(
     ROBOT_MOTION_SOURCE_AGENT, direction, steps, period_ms,
     robot_motion_default_timeout(steps, period_ms), NULL);
-  robot_world_state_set_motion_active(false);
   robot_action_guard_end(ROBOT_ACTION_MOTION, ROBOT_MOTION_TOOL_NAME,
                          ret);
+
+  if (ret < 0)
+    {
+      int network_ret;
+
+      printf("[网络确认] robot_move failed rc=%d; checking link before retry\n",
+             ret);
+      network_ret = robot_voice_wifi_reconnect_and_ensure(0);
+      if (network_ret < 0)
+        {
+          snprintf(output, output_size,
+                   "{\"ok\":false,\"error\":\"network unavailable\","
+                   "\"rc\":%d}", network_ret);
+          printf("[POWER-SAFE] mono_ms=%llu MOVE_TOOL_RETURN rc=%d\n",
+                 robot_motion_tool_now_ms(), network_ret);
+          return ERROR;
+        }
+
+      robot_action_guard_begin(ROBOT_ACTION_MOTION, ROBOT_MOTION_TOOL_NAME);
+      ret = robot_motion_submit_and_wait(
+        ROBOT_MOTION_SOURCE_AGENT, direction, steps, period_ms,
+        robot_motion_default_timeout(steps, period_ms), NULL);
+      robot_action_guard_end(ROBOT_ACTION_MOTION, ROBOT_MOTION_TOOL_NAME,
+                             ret);
+    }
 
   if (ret < 0)
     {
@@ -217,6 +283,9 @@ static int robot_motion_tool_execute_tail_wag(const char *name,
   unsigned int cycles = ROBOT_MOTION_TAIL_DEFAULT_CYCLES;
   unsigned int period_ms = ROBOT_MOTION_TAIL_DEFAULT_PERIOD;
   unsigned int amplitude_deg = ROBOT_MOTION_TAIL_DEFAULT_AMPLITUDE;
+  unsigned int session_id = 0;
+  unsigned int event_id = 0;
+  bool companion;
   int ret;
 
   if (name == NULL || input_json == NULL || output == NULL ||
@@ -243,7 +312,7 @@ static int robot_motion_tool_execute_tail_wag(const char *name,
     {
       cJSON_Delete(root);
       snprintf(output, output_size,
-               "{\"ok\":false,\"error\":\"cycles must be 1..2\"}");
+               "{\"ok\":false,\"error\":\"cycles must be 1\"}");
       return ERROR;
     }
 
@@ -255,7 +324,7 @@ static int robot_motion_tool_execute_tail_wag(const char *name,
     {
       cJSON_Delete(root);
       snprintf(output, output_size,
-               "{\"ok\":false,\"error\":\"amplitude_deg must be 3..20\"}");
+               "{\"ok\":false,\"error\":\"amplitude_deg must be 3..6\"}");
       return ERROR;
     }
 
@@ -266,22 +335,40 @@ static int robot_motion_tool_execute_tail_wag(const char *name,
     {
       cJSON_Delete(root);
       snprintf(output, output_size,
-               "{\"ok\":false,\"error\":\"period_ms must be 2600..3000\"}");
+               "{\"ok\":false,\"error\":\"period_ms must be 4500..6000\"}");
       return ERROR;
     }
+
+  item = cJSON_GetObjectItem(root, "music_session_id");
+  companion = item != NULL;
+  if (item != NULL && robot_motion_tool_number(item, 1, UINT32_MAX, &session_id) < 0)
+    { cJSON_Delete(root); snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid session token\"}"); return ERROR; }
+  item = cJSON_GetObjectItem(root, "event_id");
+  companion = companion || item != NULL;
+  if (item != NULL && robot_motion_tool_number(item, 1, UINT32_MAX, &event_id) < 0)
+    { cJSON_Delete(root); snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid event token\"}"); return ERROR; }
+  if (robot_music_media_is_active && robot_music_media_is_active()) companion = true;
 
   cJSON_Delete(root);
   printf("[ROBOT-MOTION-TOOL] tail wag cycles=%u amplitude_deg=%u "
          "period_ms=%u\n", cycles, amplitude_deg, period_ms);
   robot_action_guard_begin(ROBOT_ACTION_MOTION, ROBOT_TAIL_WAG_TOOL_NAME);
-  robot_world_state_set_motion_active(true);
-  ret = robot_motion_tail_wag_sync(ROBOT_MOTION_SOURCE_AGENT, cycles,
-                                   period_ms, amplitude_deg);
-  robot_world_state_set_motion_active(false);
+  ret = companion ? robot_motion_music_tail_wag_sync(session_id, event_id,
+                                                     period_ms, amplitude_deg) :
+                    robot_motion_tail_wag_sync(ROBOT_MOTION_SOURCE_AGENT, cycles,
+                                               period_ms, amplitude_deg);
   robot_action_guard_end(ROBOT_ACTION_MOTION, ROBOT_TAIL_WAG_TOOL_NAME, ret);
 
   printf("[POWER-SAFE] mono_ms=%llu TAIL_WAG_TOOL_RETURN rc=%d\n",
          robot_motion_tool_now_ms(), ret);
+  if (companion && (ret == -EAGAIN || ret == -EBUSY || ret == -ESTALE ||
+                    ret == -EALREADY || ret == -EPERM || ret == -ECANCELED))
+    {
+      printf("[ROBOT-MUSIC] tail skipped session=%u rc=%d\n", session_id, ret);
+      snprintf(output, output_size,
+               "{\"ok\":true,\"skipped\":true,\"rc\":%d,\"retry\":false}", ret);
+      return OK;
+    }
   if (ret < 0)
     {
       snprintf(output, output_size,
@@ -297,9 +384,83 @@ static int robot_motion_tool_execute_tail_wag(const char *name,
   return OK;
 }
 
+static int robot_motion_tool_music_react(const char *input_json,
+                                          char *output, size_t output_size)
+{
+  cJSON *root;
+  unsigned int session = 0, event = 0;
+  const char *reaction;
+  cJSON *reaction_item;
+  bool calm;
+  int ret;
+  if (input_json == NULL || output == NULL || output_size == 0) return ERROR;
+  root = cJSON_Parse(input_json);
+  if (root == NULL)
+    { snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid json\"}"); return ERROR; }
+  reaction_item = cJSON_GetObjectItem(root, "reaction");
+  reaction = cJSON_GetStringValue(reaction_item);
+  if ((reaction_item != NULL && reaction == NULL) || (reaction != NULL && strcmp(reaction, "happy") && strcmp(reaction, "listening")) ||
+      robot_motion_tool_number(cJSON_GetObjectItem(root, "music_session_id"), 1, UINT32_MAX, &session) < 0 ||
+      robot_motion_tool_number(cJSON_GetObjectItem(root, "event_id"), 1, UINT32_MAX, &event) < 0)
+    { cJSON_Delete(root); snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid music reaction token\"}"); return ERROR; }
+  calm = reaction != NULL && strcmp(reaction, "listening") == 0;
+  cJSON_Delete(root);
+  robot_action_guard_begin(ROBOT_ACTION_EXPRESSION, ROBOT_MUSIC_REACT_TOOL_NAME);
+  ret = robot_music_media_react(session, event, calm);
+  robot_action_guard_end(ROBOT_ACTION_EXPRESSION, ROBOT_MUSIC_REACT_TOOL_NAME, ret);
+  printf("[ROBOT-MUSIC] reaction session=%u event=%u rc=%d\n", session, event, ret);
+  snprintf(output, output_size, "{\"ok\":%s,\"skipped\":%s,\"rc\":%d,\"retry\":false}",
+    (ret == 0 || ret == -ESTALE || ret == -EALREADY) ? "true" : "false",
+    ret == 0 ? "false" : "true", ret);
+  return ret == 0 || ret == -ESTALE || ret == -EALREADY ? OK : ERROR;
+}
+
+static int robot_motion_tool_music_companion(const char *input_json,
+                                             char *output, size_t output_size)
+{
+  unsigned int session, event;
+  int ret;
+  cJSON *root;
+  const char *style;
+  const char *tail;
+  if (input_json == NULL || output == NULL || output_size == 0) return ERROR;
+  root = cJSON_Parse(input_json);
+  if (root == NULL)
+    { snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid json\"}"); return ERROR; }
+  cJSON *style_item = cJSON_GetObjectItem(root, "style");
+  cJSON *tail_item = cJSON_GetObjectItem(root, "tail");
+  style = cJSON_GetStringValue(style_item);
+  tail = cJSON_GetStringValue(tail_item);
+  if ((style_item != NULL && style == NULL) ||
+      (tail_item != NULL && tail == NULL) ||
+      (style != NULL && strcmp(style, "playful") && strcmp(style, "calm")) ||
+      (tail != NULL && strcmp(tail, "on") && strcmp(tail, "off")) ||
+      robot_motion_tool_number(cJSON_GetObjectItem(root, "music_session_id"), 1, UINT32_MAX, &session) < 0 ||
+      robot_motion_tool_number(cJSON_GetObjectItem(root, "event_id"), 1, UINT32_MAX, &event) < 0)
+    { cJSON_Delete(root); snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid companion policy or token\"}"); return ERROR; }
+  bool calm = style != NULL && strcmp(style, "calm") == 0;
+  bool enable_tail = tail == NULL || strcmp(tail, "on") == 0;
+  cJSON_Delete(root);
+  /* Guard only the authorization tool. Periodic local ticks do not
+   * invalidate the shared LLM cache from a background thread. */
+  robot_action_guard_begin(ROBOT_ACTION_EXPRESSION, ROBOT_MUSIC_COMPANION_TOOL_NAME);
+  ret = robot_music_media_companion_start(session, event, calm, enable_tail);
+  robot_action_guard_end(ROBOT_ACTION_EXPRESSION, ROBOT_MUSIC_COMPANION_TOOL_NAME, ret);
+  snprintf(output, output_size,
+    "{\"ok\":%s,\"enabled\":%s,\"skipped\":%s,\"rc\":%d,\"retry\":false,\"scope\":\"current_song\",\"tail_step_interval_ms\":1000,\"tail_step_deg\":3}",
+    (ret == 0 || ret == -EALREADY || ret == -ESTALE) ? "true" : "false",
+    (ret == 0 || ret == -EALREADY) ? "true" : "false",
+    ret == -ESTALE ? "true" : "false", ret);
+  return ret == 0 || ret == -EALREADY || ret == -ESTALE ? OK : ERROR;
+}
+
 static int robot_motion_tool_execute(const char *name, const char *input_json,
                                      char *output, size_t output_size)
 {
+  if (name != NULL && strcmp(name, ROBOT_MUSIC_COMPANION_TOOL_NAME) == 0)
+    return robot_motion_tool_music_companion(input_json, output, output_size);
+  if (name != NULL && strcmp(name, ROBOT_MUSIC_REACT_TOOL_NAME) == 0)
+    return robot_motion_tool_music_react(input_json, output, output_size);
   if (name != NULL && strcmp(name, ROBOT_TAIL_WAG_TOOL_NAME) == 0)
     {
       return robot_motion_tool_execute_tail_wag(name, input_json, output,
@@ -311,14 +472,23 @@ static int robot_motion_tool_execute(const char *name, const char *input_json,
 
 int robot_motion_register_tool(void)
 {
+  int ret;
+
   if (g_robot_motion_tool_registered)
     {
       return 0;
     }
 
-  tool_registry_register_provider("robot_motion",
-                                  robot_motion_tool_get_tools,
-                                  robot_motion_tool_execute);
+  ret = tool_registry_register_provider("robot_motion",
+                                        robot_motion_tool_get_tools,
+                                        robot_motion_tool_execute);
+  if (ret < 0)
+    {
+      printf("[ROBOT-MOTION-TOOL] provider registration failed rc=%d\n",
+             ret);
+      return ret;
+    }
+
   tool_registry_invalidate();
   g_robot_motion_tool_registered = true;
   printf("[ROBOT-MOTION-TOOL] provider registered\n");

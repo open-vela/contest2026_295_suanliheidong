@@ -8,6 +8,10 @@
 
 set +e
 
+/* Run the Agent in the foreground so its command reader is the only reader
+ * of the console while the ordered startup sequence is running. */
+ai_agent
+
 /*
  * Keep the media daemon out of the early boot path.  The contest audio
  * device is registered during board bring-up, but mediad owns long-lived

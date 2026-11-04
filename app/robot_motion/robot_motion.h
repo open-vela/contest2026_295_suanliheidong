@@ -19,19 +19,23 @@ extern "C"
 #define ROBOT_MOTION_DEFAULT_WALK_PERIOD 2500
 #define ROBOT_MOTION_DEFAULT_TURN_PERIOD 3000
 #define ROBOT_MOTION_TAIL_DEFAULT_CYCLES 1
-#define ROBOT_MOTION_TAIL_DEFAULT_PERIOD 3000
-#define ROBOT_MOTION_TAIL_DEFAULT_AMPLITUDE 20
+#define ROBOT_MOTION_TAIL_DEFAULT_PERIOD 5400
+#define ROBOT_MOTION_TAIL_DEFAULT_AMPLITUDE 3
 #define ROBOT_MOTION_MIN_STEPS           1
 #define ROBOT_MOTION_MAX_STEPS           10
 #define ROBOT_MOTION_MIN_PERIOD          800
 #define ROBOT_MOTION_MAX_PERIOD          3000
 #define ROBOT_MOTION_TAIL_MIN_CYCLES     1
-#define ROBOT_MOTION_TAIL_MAX_CYCLES     2
-#define ROBOT_MOTION_TAIL_MIN_PERIOD     2600
-#define ROBOT_MOTION_TAIL_MAX_PERIOD     3000
+#define ROBOT_MOTION_TAIL_MAX_CYCLES     1
+#define ROBOT_MOTION_TAIL_MIN_PERIOD     4500
+#define ROBOT_MOTION_TAIL_MAX_PERIOD     6000
 #define ROBOT_MOTION_TAIL_MIN_AMPLITUDE  3
-#define ROBOT_MOTION_TAIL_MAX_AMPLITUDE  20
-#define ROBOT_MOTION_WAIT_MARGIN_MS      15000
+#define ROBOT_MOTION_TAIL_MAX_AMPLITUDE  6
+#define ROBOT_MOTION_MUSIC_TAIL_STEP_MS  1000
+#define ROBOT_MOTION_MUSIC_TAIL_STEP_DEG 3
+#define ROBOT_MOTION_MUSIC_TAIL_LIMIT_DEG 45
+#define ROBOT_MOTION_WAIT_MARGIN_MS      30000
+#define ROBOT_MOTION_MIN_TIMEOUT_MS      60000
 #define ROBOT_MOTION_MAX_TIMEOUT_MS      120000
 
 enum robot_motion_direction_e
@@ -49,6 +53,7 @@ enum robot_motion_source_e
   ROBOT_MOTION_SOURCE_CLI,
   ROBOT_MOTION_SOURCE_AGENT,
   ROBOT_MOTION_SOURCE_BEHAVIOR,
+  ROBOT_MOTION_SOURCE_MUSIC,
   ROBOT_MOTION_SOURCE_COUNT,
 };
 
@@ -75,6 +80,7 @@ struct robot_motion_request_s
   unsigned int period_ms;
   unsigned int amplitude_deg;
   uint32_t request_id;
+  uint32_t music_session_id;
 };
 
 const char *robot_motion_direction_name(
@@ -85,6 +91,9 @@ int robot_motion_direction_from_name(const char *name,
 
 unsigned int robot_motion_default_period(
     enum robot_motion_direction_e direction);
+
+/* Return the common reduced-speed interval used by four-limb motion. */
+int robot_motion_limb_interval(unsigned int period_ms);
 
 int robot_motion_init(void);
 
@@ -114,12 +123,23 @@ int robot_motion_tail_wag_sync(enum robot_motion_source_e source,
                                unsigned int cycles, unsigned int period_ms,
                                unsigned int amplitude_deg);
 
+int robot_motion_music_tail_wag_sync(uint32_t session_id, uint32_t event_id,
+                                     unsigned int period_ms,
+                                     unsigned int amplitude_deg);
+
+/* Session-authorized runtime burst. Positive request id, never waits on DMA. */
+int robot_motion_music_tail_repeat_async(uint32_t session_id, uint32_t event_id);
+
 /* The legacy robotctl home command uses the same serialized motion gate. */
 int robot_motion_home_sync(void);
 
 bool robot_motion_is_busy(void);
 enum robot_motion_state_e robot_motion_get_state(void);
 int robot_motion_get_active(struct robot_motion_request_s *request);
+
+/* Cancel/drain only the current music-tail request before a foreground task.
+ * Reuses the motion worker's existing mutex/condition variable. */
+int robot_motion_quiesce_music(void);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,7 @@
 # Robot Proactive Idle Companion
 
+<!-- contest-skill: role=event, source=contest, runtime=idle-event -->
+
 Handle internal robot idle events and decide on a brief, natural companion
 interaction.
 

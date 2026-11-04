@@ -27,6 +27,40 @@ static void robot_oled_pixel(uint8_t frame[ROBOT_OLED_HEIGHT]
 #endif
 }
 
+static void robot_oled_clear_pixel(
+    uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES], int x, int y)
+{
+  uint8_t mask;
+
+  if (x < 0 || x >= ROBOT_OLED_WIDTH || y < 0 || y >= ROBOT_OLED_HEIGHT)
+    {
+      return;
+    }
+
+#ifdef CONFIG_LCD_PACKEDMSFIRST
+  mask = (uint8_t)(0x80u >> (x & 7));
+#else
+  mask = (uint8_t)(1u << (x & 7));
+#endif
+  frame[y][x >> 3] &= (uint8_t)~mask;
+}
+
+static void robot_oled_clear_rect(
+    uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES], int left,
+    int top, int right, int bottom)
+{
+  int x;
+  int y;
+
+  for (y = top; y <= bottom; y++)
+    {
+      for (x = left; x <= right; x++)
+        {
+          robot_oled_clear_pixel(frame, x, y);
+        }
+    }
+}
+
 static void robot_oled_line(uint8_t frame[ROBOT_OLED_HEIGHT]
                                             [ROBOT_OLED_ROW_BYTES],
                             int x0, int y0, int x1, int y1)
@@ -711,4 +745,71 @@ void robot_oled_render_expression(enum robot_expression_e expression,
                                                 [ROBOT_OLED_ROW_BYTES])
 {
   robot_oled_render_expression_frame(expression, 0, frame);
+}
+
+static void robot_oled_render_wifi_icon(
+    uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES],
+    bool connected)
+{
+  /* The three stepped strokes remain legible at the panel's native size. */
+  robot_oled_line(frame, 114, 4, 119, 1);
+  robot_oled_line(frame, 119, 1, 124, 4);
+  robot_oled_line(frame, 116, 7, 119, 5);
+  robot_oled_line(frame, 119, 5, 122, 7);
+  robot_oled_rect(frame, 118, 9, 120, 11, true);
+
+  if (!connected)
+    {
+      robot_oled_line(frame, 113, 1, 125, 13);
+    }
+}
+
+static void robot_oled_render_loading(
+    uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES],
+    unsigned int loading_frame)
+{
+  static const uint8_t glyphs[4][5] =
+    {
+      {0x1, 0x1, 0x1, 0x1, 0x7}, /* L */
+      {0x7, 0x5, 0x5, 0x5, 0x7}, /* O */
+      {0x2, 0x5, 0x7, 0x5, 0x5}, /* A */
+      {0x6, 0x5, 0x5, 0x5, 0x6}, /* D */
+    };
+  unsigned int letter;
+  unsigned int row;
+
+  for (letter = 0; letter < 4; letter++)
+    {
+      for (row = 0; row < 5; row++)
+        {
+          unsigned int bit;
+          for (bit = 0; bit < 3; bit++)
+            {
+              if (glyphs[letter][row] & (1u << (2u - bit)))
+                {
+                  robot_oled_pixel(frame, 2 + (int)letter * 4 + (int)bit,
+                                   3 + (int)row);
+                }
+            }
+        }
+    }
+
+  robot_oled_rect(frame, 20, 3, 24, 13, false);
+  robot_oled_rect(frame, 21 + (int)(loading_frame % 4u) * 1, 6,
+                  22 + (int)(loading_frame % 4u) * 1, 10, true);
+}
+
+void robot_oled_render_status(
+    uint8_t frame[ROBOT_OLED_HEIGHT][ROBOT_OLED_ROW_BYTES],
+    bool wifi_connected, bool loading, unsigned int loading_frame)
+{
+  /* Reserve the two top corners so expression decorations cannot overlap the
+   * status indicators. The face itself starts below this 16-pixel band. */
+  robot_oled_clear_rect(frame, 0, 0, 30, 15);
+  robot_oled_clear_rect(frame, 108, 0, 127, 15);
+  if (loading)
+    {
+      robot_oled_render_loading(frame, loading_frame);
+    }
+  robot_oled_render_wifi_icon(frame, wifi_connected);
 }

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <nuttx/audio/audio.h>
 #include <nuttx/audio/i2s.h>
@@ -18,7 +19,15 @@
 #include <arch/board/board.h>
 
 #include "robot_audio_playback.h"
+#include "robot_music_buffer_policy.h"
 #include "robot_voice_config.h"
+#include "robot_voice_diag.h"
+#include "robot_voice_threads.h"
+
+/* The OLED is optional at runtime. Keep the audio path linkable in builds
+ * that omit the contest display, while still exposing music rebuffer state
+ * when the display is present. */
+extern int robot_oled_set_loading(bool loading) __attribute__((weak));
 
 /*
  * Playback format mirrors the original board codec:
@@ -48,30 +57,30 @@
 
 #define RV_SOURCE_BLOCK_BYTES       1024
 #define RV_WIRE_BLOCK_BYTES \
-  ((RV_SOURCE_BLOCK_BYTES / sizeof(int16_t)) * RV_WIRE_BYTES_PER_SAMPLE)
+  ((unsigned int)((RV_SOURCE_BLOCK_BYTES / sizeof(int16_t)) * RV_WIRE_BYTES_PER_SAMPLE))
 /*
  * Must match contest_i2s.c:
  *   CONTEST_I2S_TX_RING_SLOTS = 16
  *   CONTEST_I2S_TX_SLOT_BYTES = 2048
  *
- * The lower half does not start its immutable DMA ring until all sixteen slots
- * have been bound once.  Therefore the upper layer must be able to submit all
- * sixteen initial requests without waiting for a completion.
+ * Sixteen is the maximum. START negotiates 16/8/4 slots according to actual
+ * internal memory; GETBUFFERINFO reports the selected count. Every priming,
+ * wrap and drain operation must use that same count.
  */
 #define RV_LOWER_DMA_RING_SLOTS      16
 #define RV_LOWER_DMA_SLOT_BYTES      2048
 #define RV_MAX_INFLIGHT              RV_LOWER_DMA_RING_SLOTS
 #define RV_SEND_TIMEOUT_MS           1000
+#if ROBOT_VOICE_TTS_PREBUFFER < (RV_MAX_INFLIGHT + 1) * RV_SOURCE_BLOCK_BYTES || ROBOT_VOICE_TTS_PREBUFFER > ROBOT_VOICE_TTS_STREAM_RING_BYTES
+#  error Live voice prebuffer must prime DMA and fit its bounded ring
+#endif
 
-/* F7J transient producer-gap grace.
- *
- * One 1024-byte PCM16 source block is ~21.3 ms.  With sixteen immutable DMA
- * slots, once a slot is released there is far more than 15 ms before that
- * same physical slot is needed again.  Use part of that safety window to
- * wait for late Media PCM instead of inserting an audible silent block.
- */
-#define RV_UNDERRUN_GRACE_US          500000
-#define RV_UNDERRUN_POLL_US            2000
+/* A released cyclic DMA slot must be refilled immediately. Waiting for the
+ * producer here allows old payloads to circulate. Voice instead waits for
+ * complete PCM before priming; streaming music retains its existing policy. */
+#define RV_REFILL_WINDOW_MS(pb) \
+  (((pb)->slot_count - 1) * RV_SOURCE_BLOCK_BYTES * 1000 / \
+   (RV_TTS_SAMPLE_RATE * sizeof(int16_t)))
 
 /*
  * Diagnostic switches.  Keep both at zero for normal TTS playback.
@@ -95,14 +104,14 @@
 /*
  * Ring-buffer values from tts_pcm_playback_guide.md:
  *
- *   Ring Buffer     = 512 KiB
- *   Start Prebuffer = 128 KiB
+ *   Music Ring      = 2 MiB (PSRAM jitter cushion)
+ *   Music Prebuffer = 512 KiB; voice SSE prebuffer = 24 KiB
  *   Rebuffer        =  48 KiB (legacy threshold; F7I does not rebuffer once PLAYING)
  *
- * The playback worker is created at open time and waits in PREBUFFER while
- * the PCM producer fills the ring.
+ * The worker waits in PREBUFFER while PCM arrives. Cached voice waits for
+ * EOS; live voice starts at its prebuffer and retains a real final block.
  *
- * F7K invariant for the immutable contest I2S DMA ring:
+ * Legacy streaming-music invariant for the immutable contest I2S DMA ring:
  * once PLAYING has started, the worker must keep every released DMA slot
  * refreshed.  If the producer temporarily runs dry, submit silence instead
  * of entering REBUFFER and leaving old slot payloads circulating in hardware.
@@ -110,11 +119,21 @@
 #if RV_FULL_CACHE_AB_TEST
 #  define RV_RING_BYTES             (2 * 1024 * 1024)
 #  define RV_START_PREBUFFER_BYTES  RV_RING_BYTES
+#  define RV_MUSIC_RING_BYTES       RV_RING_BYTES
+#  define RV_MUSIC_START_PREBUFFER_BYTES RV_RING_BYTES
 #else
 #  define RV_RING_BYTES             (512 * 1024)
 #  define RV_START_PREBUFFER_BYTES  (128 * 1024)
+#  define RV_MUSIC_RING_BYTES       (4 * 1024 * 1024)
+#  define RV_MUSIC_START_PREBUFFER_BYTES (512 * 1024)
 #endif
 #define RV_REBUFFER_BYTES           (48 * 1024)
+/* Native Media's URL input is bursty. Keep the large music ring for jitter
+ * headroom and wait for a useful amount of PCM before enabling I2S. One DMA
+ * ring (4 KiB) is only about 85 ms at 24 kHz mono and starts an immediate
+ * underrun when the redirected URL is still filling its first TCP buffers. */
+#define RV_NATIVE_MEDIA_RING_BYTES  (512 * 1024)
+#define RV_NATIVE_MEDIA_PREBUFFER_BYTES (32 * 1024)
 
 /* The proven version used priority 120.  Keep that real-time bias.  Use a
  * larger stack than the old 4 KiB implementation because this contest-local
@@ -122,7 +141,19 @@
  * identical to the proven code.
  */
 #define RV_WORKER_STACK             (16 * 1024)
-#define RV_WORKER_PRIORITY          120
+#define RV_WORKER_PRIORITY          ROBOT_VOICE_PLAY_PRIORITY
+
+static unsigned long long rv_audio_now_ms(void)
+{
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+    {
+      return 0;
+    }
+
+  return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 enum rv_play_state_e
 {
@@ -139,6 +170,7 @@ struct rv_ring_s
   size_t head;
   size_t tail;
   size_t count;
+  size_t capacity;
 };
 
 struct rv_playback_s;
@@ -153,6 +185,8 @@ struct rv_slot_s
   unsigned int index;
   uint32_t submit_count;
   uint32_t done_count;
+  unsigned long long done_ms;
+  size_t source_bytes;
 };
 
 struct rv_playback_s
@@ -178,14 +212,37 @@ struct rv_playback_s
   int terminal_tail_done;
   int eos_silence_rounds;
   enum rv_play_state_e state;
+  unsigned int start_prebuffer;
   uint32_t underrun_count;
   size_t ring_min_play;
   size_t ring_max_play;
 
   struct rv_ring_s ring;
+  unsigned int slot_count;
   struct rv_slot_s slots[RV_MAX_INFLIGHT];
 
   size_t total_written;
+  size_t total_read;
+  uint32_t input_hash, output_hash;
+  unsigned int id;
+  int cache_until_eos;
+  int voice_live;
+  bool native_media;
+  bool media_started;
+  bool media_paused;
+  bool music_buffering;
+  unsigned int music_rebuffers;
+  uint64_t completed_source_bytes;
+  unsigned long long open_ms, first_pcm_ms, last_pcm_ms, max_pcm_gap_ms;
+  unsigned long long dma_start_ms, dma_done_ms;
+  unsigned long long last_diag_ms;
+  unsigned long long commit_ms, user_end_ms, tts_start_ms, tts_ready_ms;
+  unsigned long run_id;
+  unsigned int sentence;
+  unsigned long long max_refill_ms, max_send_ms, last_callback_ms, max_callback_gap_ms;
+  uint32_t late_refills, callback_errors, silence_blocks, tail_pad_bytes;
+  uint32_t gap_run, max_gap_run;
+
   uint8_t diagnostic_tone_phase;
   int opened;
   int finished;
@@ -193,8 +250,59 @@ struct rv_playback_s
 
 static struct rv_playback_s g_pb;
 static int g_stop_on_short_underrun;
+static volatile bool g_media_voice_mode;
+static unsigned int g_playback_id;
 
 static void rv_signal_all(struct rv_playback_s *pb);
+
+static const char *rv_play_state_name(enum rv_play_state_e state)
+{
+  switch (state)
+    {
+      case RV_STATE_PREBUFFER:
+        return "prebuffer";
+      case RV_STATE_PLAYING:
+        return "playing";
+      case RV_STATE_REBUFFER:
+        return "rebuffer";
+      case RV_STATE_DRAINING:
+        return "draining";
+      case RV_STATE_STOPPED:
+        return "stopped";
+      default:
+        return "unknown";
+    }
+}
+
+static void rv_report_playback_diag(struct rv_playback_s *pb,
+                                    size_t available,
+                                    unsigned int slot_index,
+                                    int primed_slots)
+{
+  unsigned long long now;
+
+  if (pb == NULL)
+    {
+      return;
+    }
+
+  now = rv_audio_now_ms();
+  if (pb->last_diag_ms != 0 && now - pb->last_diag_ms < 1000)
+    {
+      return;
+    }
+
+  pb->last_diag_ms = now;
+  printf("[RV-PB-DIAG] id=%u state=%s buffered=%zu/%zu written=%zu "
+         "read=%zu underruns=%lu silence=%lu inflight=%d slots=%u "
+         "primed=%d next=%u pcm_gap_max_ms=%llu dma_gap_max_ms=%llu\n",
+         pb->id, rv_play_state_name(pb->state), available,
+         pb->ring.capacity, pb->total_written, pb->total_read,
+         (unsigned long)pb->underrun_count,
+         (unsigned long)pb->silence_blocks, pb->i2s_inflight,
+         pb->slot_count, primed_slots, slot_index, pb->max_pcm_gap_ms,
+         pb->max_callback_gap_ms);
+}
 
 static int rv_lock(struct rv_playback_s *pb)
 {
@@ -248,6 +356,26 @@ static int rv_get_result(struct rv_playback_s *pb)
   return value;
 }
 
+/* The task owner can cancel while the playback worker reaches EOS. Reuse
+ * i2s_started's existing word: -1 marks STOP in progress, avoiding duplicate
+ * driver STOP calls or reading a checkpoint before its callbacks finish. */
+static void rv_stop_i2s(struct rv_playback_s *pb)
+{
+  int started = 1;
+  if (pb->i2s == NULL) return;
+  if (__atomic_compare_exchange_n(&pb->i2s_started, &started, -1, false,
+                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    {
+      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      __atomic_store_n(&pb->i2s_started, 0, __ATOMIC_RELEASE);
+    }
+  else
+    {
+      while (__atomic_load_n(&pb->i2s_started, __ATOMIC_ACQUIRE) == -1)
+        usleep(100);
+    }
+}
+
 static int rv_ring_write(struct rv_playback_s *pb,
                          const uint8_t *src, size_t len)
 {
@@ -278,32 +406,32 @@ static int rv_ring_write(struct rv_playback_s *pb,
       return -EPIPE;
     }
 
-  space = RV_RING_BYTES - pb->ring.count;
+  space = pb->ring.capacity - pb->ring.count;
   if (len > space)
     {
       size_t buffered = pb->ring.count;
       rv_unlock(pb);
 
-      printf("[RV-PB] PCM cache full buffered=%zu incoming=%zu capacity=%u\n",
-             buffered, len, RV_RING_BYTES);
+      RV_VERBOSE("[RV-PB] PCM cache full buffered=%zu incoming=%zu capacity=%u\n",
+             buffered, len, (unsigned int)pb->ring.capacity);
       return -ENOSPC;
     }
 
-  first = RV_RING_BYTES - pb->ring.head;
+  first = pb->ring.capacity - pb->ring.head;
   if (first > len)
     {
       first = len;
     }
 
   memcpy(pb->ring.data + pb->ring.head, src, first);
-  pb->ring.head = (pb->ring.head + first) % RV_RING_BYTES;
+  pb->ring.head = (pb->ring.head + first) % pb->ring.capacity;
   pb->ring.count += first;
 
   second = len - first;
   if (second > 0)
     {
       memcpy(pb->ring.data + pb->ring.head, src + first, second);
-      pb->ring.head = (pb->ring.head + second) % RV_RING_BYTES;
+      pb->ring.head = (pb->ring.head + second) % pb->ring.capacity;
       pb->ring.count += second;
     }
 
@@ -312,6 +440,15 @@ static int rv_ring_write(struct rv_playback_s *pb,
       pb->ring_max_play = pb->ring.count;
     }
 
+  {
+    unsigned long long now = rv_audio_now_ms();
+    if (!pb->first_pcm_ms) pb->first_pcm_ms = now;
+    if (pb->last_pcm_ms && now - pb->last_pcm_ms > pb->max_pcm_gap_ms)
+      pb->max_pcm_gap_ms = now - pb->last_pcm_ms;
+    pb->last_pcm_ms = now;
+    pb->input_hash = rv_pcm_hash(pb->input_hash, src, len);
+    pb->total_written += len;
+  }
   rv_unlock(pb);
   nxsem_post(&pb->ring_data);
   return 0;
@@ -334,7 +471,7 @@ static size_t rv_ring_read(struct rv_playback_s *pb,
       n = wanted;
     }
 
-  first = RV_RING_BYTES - pb->ring.tail;
+  first = pb->ring.capacity - pb->ring.tail;
   if (first > n)
     {
       first = n;
@@ -343,7 +480,7 @@ static size_t rv_ring_read(struct rv_playback_s *pb,
   if (first > 0)
     {
       memcpy(dst, pb->ring.data + pb->ring.tail, first);
-      pb->ring.tail = (pb->ring.tail + first) % RV_RING_BYTES;
+      pb->ring.tail = (pb->ring.tail + first) % pb->ring.capacity;
       pb->ring.count -= first;
     }
 
@@ -352,7 +489,7 @@ static size_t rv_ring_read(struct rv_playback_s *pb,
       size_t second = n - first;
 
       memcpy(dst + first, pb->ring.data + pb->ring.tail, second);
-      pb->ring.tail = (pb->ring.tail + second) % RV_RING_BYTES;
+      pb->ring.tail = (pb->ring.tail + second) % pb->ring.capacity;
       pb->ring.count -= second;
     }
 
@@ -362,6 +499,11 @@ static size_t rv_ring_read(struct rv_playback_s *pb,
       pb->ring_min_play = pb->ring.count;
     }
 
+  if (n > 0)
+    {
+      pb->output_hash = rv_pcm_hash(pb->output_hash, dst, n);
+      pb->total_read += n;
+    }
   rv_unlock(pb);
 
   if (n > 0)
@@ -380,7 +522,6 @@ static void rv_i2s_done(struct i2s_dev_s *dev,
   struct rv_playback_s *pb;
 
   (void)dev;
-  (void)apb;
 
   if (slot == NULL || slot->pb == NULL)
     {
@@ -391,7 +532,23 @@ static void rv_i2s_done(struct i2s_dev_s *dev,
 
   if (rv_lock(pb) == 0)
     {
+      if (!slot->inflight || (apb && apb != slot->apb))
+        {
+          pb->callback_errors++;
+          if (pb->i2s_result >= 0) pb->i2s_result = -EPROTO;
+          rv_unlock(pb);
+          nxsem_post(&slot->done);
+          nxsem_post(&pb->i2s_done);
+          return;
+        }
+      slot->done_ms = rv_audio_now_ms();
+      if (pb->last_callback_ms &&
+          slot->done_ms - pb->last_callback_ms > pb->max_callback_gap_ms)
+        pb->max_callback_gap_ms = slot->done_ms - pb->last_callback_ms;
+      pb->last_callback_ms = slot->done_ms;
       slot->result = result;
+      if (result == 0) pb->completed_source_bytes += slot->source_bytes;
+      slot->source_bytes = 0;
       slot->inflight = 0;
       slot->done_count++;
 
@@ -410,6 +567,8 @@ static void rv_i2s_done(struct i2s_dev_s *dev,
   else
     {
       slot->result = result;
+      if (result == 0) pb->completed_source_bytes += slot->source_bytes;
+      slot->source_bytes = 0;
       slot->inflight = 0;
       slot->done_count++;
 
@@ -477,7 +636,8 @@ static int rv_wait_slot(struct rv_playback_s *pb,
 
 static int rv_queue_slot(struct rv_playback_s *pb,
                          struct rv_slot_s *slot,
-                         const uint8_t *src, size_t len)
+                         const uint8_t *src, size_t len,
+                         bool final_block, size_t source_bytes)
 {
   struct audio_buf_desc_s desc;
   struct ap_buffer_s *apb;
@@ -525,6 +685,8 @@ static int rv_queue_slot(struct rv_playback_s *pb,
       return ret;
     }
 
+  if (pb->stopped) return -ECANCELED;
+
   /* One stable APB per upper playback slot.  The lower half copies every
    * submitted block into its private immutable DMA ring payload. */
   if (slot->apb == NULL)
@@ -540,7 +702,7 @@ static int rv_queue_slot(struct rv_playback_s *pb,
           return ret < 0 ? ret : -ENOMEM;
         }
 
-      printf("[RV-PB] fixed APB slot=%u ptr=%p bytes=%u\n",
+      RV_VERBOSE("[RV-PB] fixed APB slot=%u ptr=%p bytes=%u\n",
              slot->index, slot->apb->samp, RV_WIRE_BLOCK_BYTES);
     }
 
@@ -550,7 +712,9 @@ static int rv_queue_slot(struct rv_playback_s *pb,
    * Legacy/TTS short blocks still use zero padding.  Media terminal tails
    * do not pad beyond tx_len: the lower-half descriptor itself is shortened.
    */
-  if (tx_len < RV_WIRE_BLOCK_BYTES && !pb->stop_on_short_underrun)
+  if (tx_len < RV_WIRE_BLOCK_BYTES &&
+      !(pb->stop_on_short_underrun &&
+        ((!pb->voice_live && !pb->native_media) || final_block)))
     {
       memset(apb->samp, 0, RV_WIRE_BLOCK_BYTES);
     }
@@ -616,11 +780,17 @@ static int rv_queue_slot(struct rv_playback_s *pb,
 
 
   apb->curbyte = 0;
-  if (pb->stop_on_short_underrun && tx_len < RV_WIRE_BLOCK_BYTES)
+  apb->flags &= ~AUDIO_APB_FINAL;
+  if (final_block)
+    {
+      apb->flags |= AUDIO_APB_FINAL;
+    }
+  if (pb->stop_on_short_underrun && tx_len < RV_WIRE_BLOCK_BYTES &&
+      ((!pb->voice_live && !pb->native_media) || final_block))
     {
       apb->nbytes = tx_len;
       apb->nsamples = frames;
-      printf("[RV-PB] terminal tail source=%zu wire=%zu samples=%zu\n",
+      RV_VERBOSE("[RV-PB] terminal tail source=%zu wire=%zu samples=%zu\n",
              len, tx_len, frames);
     }
   else
@@ -637,19 +807,40 @@ static int rv_queue_slot(struct rv_playback_s *pb,
       return ret;
     }
 
+  if (slot->done_ms)
+    {
+      unsigned long long delay = rv_audio_now_ms() - slot->done_ms;
+      if (delay > pb->max_refill_ms) pb->max_refill_ms = delay;
+      if (delay >= RV_REFILL_WINDOW_MS(pb)) pb->late_refills++;
+    }
+  if (len < RV_SOURCE_BLOCK_BYTES && !pb->stop_on_short_underrun)
+    pb->tail_pad_bytes += RV_SOURCE_BLOCK_BYTES - len;
   slot->result = -EINPROGRESS;
+  slot->source_bytes = source_bytes;
   slot->inflight = 1;
   slot->submit_count++;
   pb->i2s_inflight++;
   rv_unlock(pb);
 
-  ret = I2S_SEND(pb->i2s, apb, rv_i2s_done, slot,
-                 MSEC2TICK(RV_SEND_TIMEOUT_MS));
+  {
+    unsigned long long send_at = rv_audio_now_ms();
+    ret = I2S_SEND(pb->i2s, apb, rv_i2s_done, slot,
+                   MSEC2TICK(RV_SEND_TIMEOUT_MS));
+    unsigned long long elapsed = rv_audio_now_ms() - send_at;
+    if (elapsed > pb->max_send_ms) pb->max_send_ms = elapsed;
+
+    if (pb->native_media && slot->submit_count == 1)
+      {
+        printf("[RV-PB] native DMA submit slot=%u bytes=%zu rc=%d\n",
+               slot->index, (size_t)apb->nbytes, ret);
+      }
+  }
   if (ret < 0)
     {
       if (rv_lock(pb) == 0)
         {
           slot->result = ret;
+          slot->source_bytes = 0;
           slot->inflight = 0;
 
           if (pb->i2s_inflight > 0)
@@ -721,12 +912,15 @@ static int rv_wait_buffer(struct rv_playback_s *pb, size_t threshold)
           return 0;
         }
 #else
-      if (available >= threshold)
+      if ((!pb->native_media ||
+           __atomic_load_n(&pb->media_started, __ATOMIC_ACQUIRE)) &&
+          ((pb->cache_until_eos && pb->eos) ||
+           (!pb->cache_until_eos && available >= threshold) || pb->eos))
         {
           return 0;
         }
 
-      if (pb->eos || pb->stopped)
+      if (pb->stopped)
         {
           return 0;
         }
@@ -749,38 +943,6 @@ static int rv_wait_buffer(struct rv_playback_s *pb, size_t threshold)
     }
 }
 
-static size_t rv_wait_transient_gap(struct rv_playback_s *pb,
-                                    size_t initial_available)
-{
-  size_t available = initial_available;
-  unsigned int waited = 0;
-
-  while (!pb->eos && !pb->stopped &&
-         available < RV_SOURCE_BLOCK_BYTES &&
-         waited < RV_UNDERRUN_GRACE_US)
-    {
-      int result = rv_get_result(pb);
-
-      if (result < 0)
-        {
-          break;
-        }
-
-      usleep(RV_UNDERRUN_POLL_US);
-      waited += RV_UNDERRUN_POLL_US;
-      available = rv_ring_count(pb);
-    }
-
-  if (waited > 0 &&
-      available >= RV_SOURCE_BLOCK_BYTES)
-    {
-      printf("[RV-PB] transient gap recovered wait_us=%u buffered=%zu\n",
-             waited, available);
-    }
-
-  return available;
-}
-
 static void *rv_worker(void *arg)
 {
   struct rv_playback_s *pb = arg;
@@ -790,15 +952,13 @@ static void *rv_worker(void *arg)
   int ret = 0;
   bool terminal_tail = false;
 
-  printf("[RV-PB] worker start source_rate=%u wire_rate=%u "
-         "source=mono16 wire=mono-left32 gain_q16=%u resample=none "
-         "source_block=%u wire_block=%u slots=%u priority=%u "
-         "underrun_policy=grace-then-silence grace_us=%u sample_precision=full-q16\n",
-         RV_TTS_SAMPLE_RATE, RV_WIRE_SAMPLE_RATE, RV_OUTPUT_GAIN_Q16,
-         RV_SOURCE_BLOCK_BYTES, RV_WIRE_BLOCK_BYTES,
-         RV_MAX_INFLIGHT, RV_WORKER_PRIORITY, RV_UNDERRUN_GRACE_US);
-
   pb->state = RV_STATE_PREBUFFER;
+
+  if (pb->native_media)
+    {
+      printf("[RV-PB] native worker ready slots=%u prebuffer=%u\n",
+             pb->slot_count, pb->start_prebuffer);
+    }
 
   while (!pb->stopped)
     {
@@ -809,18 +969,26 @@ static void *rv_worker(void *arg)
       size_t want;
       size_t got;
       bool prime_silence = false;
+      bool final_block = false;
+      bool music_stream = !pb->cache_until_eos && !pb->voice_live &&
+                          !pb->native_media;
 
       ret = rv_get_result(pb);
       if (ret < 0)
         {
-          printf("[RV-PB] I2S worker error=%d\n", ret);
+          printf("[RV-PB] I2S worker error=%d state=%s buffered=%zu/%zu "
+                 "inflight=%d underruns=%lu silence=%lu\n",
+                 ret, rv_play_state_name(pb->state), rv_ring_count(pb),
+                 pb->ring.capacity, pb->i2s_inflight,
+                 (unsigned long)pb->underrun_count,
+                 (unsigned long)pb->silence_blocks);
           break;
         }
 
       if (pb->state == RV_STATE_PREBUFFER || pb->state == RV_STATE_REBUFFER)
         {
           size_t threshold = pb->state == RV_STATE_PREBUFFER ?
-                             RV_START_PREBUFFER_BYTES : RV_REBUFFER_BYTES;
+                             pb->start_prebuffer : RV_REBUFFER_BYTES;
           const char *from = pb->state == RV_STATE_PREBUFFER ?
                              "PREBUFFER" : "REBUFFER";
 
@@ -830,6 +998,7 @@ static void *rv_worker(void *arg)
               break;
             }
 
+          if (pb->stopped) { ret = -ECANCELED; break; }
           available = rv_ring_count(pb);
           if (available >= 2)
             {
@@ -847,13 +1016,7 @@ static void *rv_worker(void *arg)
                   pb->ring_max_play = available;
                 }
 
-              printf("[RV-PB] %s -> PLAYING buffered=%zu inflight=%d "
-                     "dma_window=%u blocks (~%u ms)\n",
-                     from, available, rv_get_inflight(pb),
-                     RV_MAX_INFLIGHT,
-                     (unsigned int)(RV_MAX_INFLIGHT *
-                       RV_SOURCE_BLOCK_BYTES * 1000 /
-                       (RV_TTS_SAMPLE_RATE * sizeof(int16_t))));
+              (void)from;
             }
           else if (pb->eos)
             {
@@ -872,15 +1035,10 @@ static void *rv_worker(void *arg)
 
       slot = &pb->slots[slot_index];
 
-      /* Deeper DMA submit window:
-       * prime all fixed slots, then wait/refill round-robin.
-       *
-       * Sixteen 1024-byte source blocks provide about 341 ms of 24 kHz mono
-       * PCM queue depth. Each source block remains 1024 bytes on the wire.
-       * while giving HPWORK/callback/worker jitter twice as much time before
-       * a zero-filled slot can wrap back to hardware.
-       */
-      if (primed_slots >= RV_MAX_INFLIGHT)
+      /* Prime the negotiated number of slots, then refill in that same
+       * round-robin order. Each source block expands to the fixed wire size;
+       * a larger ring gives more callback/worker scheduling headroom. */
+      if (primed_slots >= pb->slot_count)
         {
           ret = rv_wait_slot(pb, slot);
           if (ret < 0)
@@ -890,40 +1048,79 @@ static void *rv_worker(void *arg)
         }
 
       available = rv_ring_count(pb);
+      rv_report_playback_diag(pb, available, slot_index, primed_slots);
 
-      /*
-       * Streaming TTS is allowed a producer-jitter grace window.
-       *
-       * Finite-file Media playback is different: the bridge enables
-       * stop_on_short_underrun specifically so the last partial PCM block is
-       * the terminal tail.  Waiting here while the immutable DMA ring keeps
-       * running can replay already-consumed tail slots several times.
-       *
-       * Therefore exact-tail mode never waits for more PCM once less than one
-       * complete source block remains: play the remaining aligned bytes once,
-       * mark that descriptor terminal (next=NULL), then stop after FIFO drain.
-       */
-      if (!pb->eos &&
-          available < RV_SOURCE_BLOCK_BYTES &&
-          !pb->stop_on_short_underrun)
+      /* Preserve newly arriving fragments until there is a useful music
+       * window. Continue submitting fresh silence at DMA cadence; waiting
+       * here would replay old cyclic descriptors. Slot indices never reset. */
+      if (music_stream)
         {
-          available = rv_wait_transient_gap(pb, available);
-        }
-      else if (!pb->eos &&
-               available < RV_SOURCE_BLOCK_BYTES &&
-               pb->stop_on_short_underrun)
-        {
-          printf("[RV-PB] media exact-tail buffered=%zu -> no grace wait\n",
-                 available);
+          bool old_hold = __atomic_load_n(&pb->music_buffering, __ATOMIC_ACQUIRE);
+          bool hold = robot_music_buffer_hold(old_hold, available, pb->eos,
+                                               pb->ring.capacity);
+          __atomic_store_n(&pb->music_buffering, hold, __ATOMIC_RELEASE);
+          if (hold != old_hold)
+            {
+              if (hold) pb->music_rebuffers++;
+              if (robot_oled_set_loading != NULL)
+                {
+                  (void)robot_oled_set_loading(hold);
+                }
+              printf("[RV-MUSIC-BUFFER] id=%u %s buffered=%zu recover=%u episodes=%u\n",
+                pb->id, hold ? "hold-silence" : "resume-pcm", available,
+                ROBOT_MUSIC_BUFFER_RECOVER_BYTES, pb->music_rebuffers);
+            }
         }
 
-      if (available >= RV_SOURCE_BLOCK_BYTES)
+      /* No producer wait is permitted once the immutable DMA ring runs.
+       * cache_until_eos voice has all its PCM here, so no interior gap exists. */
+      if (music_stream &&
+          __atomic_load_n(&pb->music_buffering, __ATOMIC_ACQUIRE))
+        {
+          memset(block, 0, sizeof(block));
+          want = RV_SOURCE_BLOCK_BYTES;
+          prime_silence = true;
+          pb->underrun_count++;
+        }
+      else if (pb->native_media &&
+          __atomic_load_n(&pb->media_paused, __ATOMIC_ACQUIRE))
+        {
+          /* Keep the immutable hardware ring fresh while preserving every
+           * queued real sample. A pause is neither EOS nor a short tail. */
+          memset(block, 0, sizeof(block));
+          want = RV_SOURCE_BLOCK_BYTES;
+          prime_silence = true;
+        }
+      else if (pb->voice_live && !pb->eos &&
+          available < 2 * RV_SOURCE_BLOCK_BYTES)
+        {
+          /* Retain one real block until EOS is known so even an exact block
+           * tail receives AUDIO_APB_FINAL. Never wait on a running immutable
+           * DMA slot: overwrite it with silence during a producer gap. */
+          memset(block, 0, sizeof(block));
+          want = RV_SOURCE_BLOCK_BYTES;
+          prime_silence = true;
+          pb->underrun_count++;
+          pb->silence_blocks++;
+          pb->gap_run++;
+          if (pb->gap_run > pb->max_gap_run) pb->max_gap_run = pb->gap_run;
+        }
+      else if (available >= RV_SOURCE_BLOCK_BYTES)
         {
           want = RV_SOURCE_BLOCK_BYTES;
+          pb->gap_run = 0;
+          if (pb->eos && available == RV_SOURCE_BLOCK_BYTES &&
+              pb->stop_on_short_underrun)
+            {
+              final_block = true;
+              terminal_tail = true;
+            }
         }
       else if (pb->eos && available > 0)
         {
           want = available & ~(size_t)1;
+          final_block = pb->stop_on_short_underrun;
+          terminal_tail = final_block;
           if (want == 0)
             {
               (void)rv_ring_read(pb, block, available);
@@ -940,24 +1137,23 @@ static void *rv_worker(void *arg)
                * cyclic ring.  Drain the already-submitted real blocks and
                * stop.
                */
-              printf("[RV-PB] media EOF empty -> DRAINING immediately\n");
+
               pb->eos_silence_rounds = 0;
               pb->state = RV_STATE_DRAINING;
               break;
             }
 
-          if (pb->eos_silence_rounds < RV_MAX_INFLIGHT)
+          if (pb->eos_silence_rounds < pb->slot_count)
             {
               memset(block, 0, sizeof(block));
               want = RV_SOURCE_BLOCK_BYTES;
               prime_silence = true;
               pb->eos_silence_rounds++;
-              printf("[RV-PB] EOS silence fill slot=%u round=%d/%u\n",
-                     slot_index, pb->eos_silence_rounds, RV_MAX_INFLIGHT);
+              pb->silence_blocks++;
             }
           else
             {
-              printf("[RV-PB] EOS DMA slots sanitized -> DRAINING\n");
+
               pb->eos_silence_rounds = 0;
               pb->state = RV_STATE_DRAINING;
               break;
@@ -967,7 +1163,7 @@ static void *rv_worker(void *arg)
       else
         {
           /*
-           * F7I: NEVER stop feeding the immutable cyclic DMA ring after
+           * Legacy streaming-music path only: NEVER stop feeding the immutable cyclic DMA ring after
            * PLAYING has started.
            *
            * The lower half keeps its 16 frozen descriptors circulating even
@@ -983,9 +1179,29 @@ static void *rv_worker(void *arg)
            *     source block.
            *
            * A producer stall can therefore create silence, never stale-audio
-           * repetition.  Initial PREBUFFER behavior is unchanged.
+           * repetition. Complete-cache voice must never enter this path.
            */
+          if (pb->cache_until_eos)
+            {
+              /* Complete-cache voice can never starve. Stop on invariant
+               * failure instead of adding any silence in the utterance. */
+              ret = -EPROTO;
+              break;
+            }
           pb->underrun_count++;
+          pb->gap_run++;
+          if (pb->gap_run > pb->max_gap_run) pb->max_gap_run = pb->gap_run;
+
+          if ((pb->native_media || !pb->voice_live) &&
+              (pb->underrun_count == 1 ||
+               (pb->underrun_count % 512) == 0))
+            {
+              printf("[RV-PB] streaming PCM underflow=%lu buffered=%zu/%zu "
+                     "low_water=%zu silence=%lu\n",
+                     (unsigned long)pb->underrun_count, available,
+                     pb->ring.capacity, pb->ring_min_play,
+                     (unsigned long)pb->silence_blocks);
+            }
 
           if (available >= sizeof(int16_t))
             {
@@ -997,22 +1213,17 @@ static void *rv_worker(void *arg)
 
               want &= ~(size_t)1;
 
-              if (pb->stop_on_short_underrun)
+              if (pb->stop_on_short_underrun && !pb->native_media)
                 {
                   terminal_tail = true;
+                  final_block = true;
                   pb->eos = 1;
-                  printf("[RV-PB] underrun #%lu short-fill=%zu "
-                         "buffered=%zu -> play terminal tail ONCE\n",
-                         (unsigned long)pb->underrun_count,
-                         want, available);
+                  (void)0;
                 }
               else if (pb->underrun_count <= 4 ||
                        (pb->underrun_count % 32) == 0)
                 {
-                  printf("[RV-PB] underrun #%lu short-fill=%zu "
-                         "buffered=%zu -> silence-pad slot\n",
-                         (unsigned long)pb->underrun_count,
-                         want, available);
+                  (void)0;
                 }
             }
           else
@@ -1028,19 +1239,16 @@ static void *rv_worker(void *arg)
                   (void)rv_ring_read(pb, block, available);
                 }
 
-              if (pb->stop_on_short_underrun)
+              if (pb->stop_on_short_underrun && !pb->native_media)
                 {
-                  printf("[RV-PB] underrun #%lu buffered=%zu "
-                         "-> no tail, stop now\n",
-                         (unsigned long)pb->underrun_count, available);
+                  (void)0;
                   pb->eos = 1;
                   pb->stopped = 1;
                   pb->terminal_tail_done = 1;
 
                   if (pb->i2s != NULL && pb->i2s_started)
                     {
-                      pb->i2s_started = 0;
-                      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+                      rv_stop_i2s(pb);
                     }
 
                   rv_signal_all(pb);
@@ -1050,15 +1258,14 @@ static void *rv_worker(void *arg)
               if (pb->underrun_count <= 4 ||
                   (pb->underrun_count % 32) == 0)
                 {
-                  printf("[RV-PB] underrun #%lu buffered=%zu "
-                         "-> silent DMA slot\n",
-                         (unsigned long)pb->underrun_count, available);
+                  (void)0;
                 }
             }
         }
 
       if (prime_silence)
         {
+          if (music_stream) pb->silence_blocks++;
           got = want;
         }
       else
@@ -1070,7 +1277,8 @@ static void *rv_worker(void *arg)
             }
         }
 
-      ret = rv_queue_slot(pb, slot, block, got);
+      ret = rv_queue_slot(pb, slot, block, got, final_block,
+                          prime_silence ? 0 : got);
       if (ret < 0)
         {
           if (ret != -ECANCELED)
@@ -1081,6 +1289,17 @@ static void *rv_worker(void *arg)
           break;
         }
 
+      if (!pb->dma_start_ms &&
+          (primed_slots + 1 >= pb->slot_count || final_block)) {
+        /* A short finite chain starts on its FINAL send too. This software
+         * submission timestamp is not an acoustic measurement. */
+        pb->dma_start_ms = rv_audio_now_ms();
+        if (pb->voice_live && pb->sentence)
+          RV_EVENT("[耗时][TTS播放] run=%lu seq=%u 请求到播放提交=%lldms 音频交付到播放提交=%lldms\n",
+            pb->run_id, pb->sentence, rv_elapsed_ms(pb->tts_start_ms, pb->dma_start_ms),
+            rv_elapsed_ms(pb->tts_ready_ms, pb->dma_start_ms));
+      }
+
       if (terminal_tail)
         {
           int tail_ret = rv_wait_slot(pb, slot);
@@ -1090,7 +1309,7 @@ static void *rv_worker(void *arg)
               ret = tail_ret;
             }
 
-          printf("[RV-PB] terminal tail complete source=%zu -> STOP\n", got);
+
 
           pb->terminal_tail_done = 1;
           pb->stopped = 1;
@@ -1098,27 +1317,26 @@ static void *rv_worker(void *arg)
 
           if (pb->i2s != NULL && pb->i2s_started)
             {
-              pb->i2s_started = 0;
-              I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+              rv_stop_i2s(pb);
             }
 
           rv_signal_all(pb);
           break;
         }
 
-      if (primed_slots < RV_MAX_INFLIGHT)
+      if (primed_slots < pb->slot_count)
         {
           primed_slots++;
         }
 
-      slot_index = (slot_index + 1) % RV_MAX_INFLIGHT;
+      slot_index = (slot_index + 1) % pb->slot_count;
     }
 
   /* Do not stop I2S before the logical slots have completed. */
   {
     unsigned int i;
 
-    for (i = 0; i < RV_MAX_INFLIGHT; i++)
+    for (i = 0; i < pb->slot_count; i++)
       {
         int slot_ret = rv_wait_slot(pb, &pb->slots[i]);
         if (slot_ret < 0 && slot_ret != -ECANCELED && ret >= 0)
@@ -1153,30 +1371,8 @@ static void *rv_worker(void *arg)
       pb->state = RV_STATE_STOPPED;
     }
 
-  printf("[RV-PB] worker exit buffered=%zu inflight=%d underruns=%lu "
-         "result=%d eos=%d stopped=%d "
-         "slots=%lu/%lu,%lu/%lu,%lu/%lu,%lu/%lu,"
-         "%lu/%lu,%lu/%lu,%lu/%lu,%lu/%lu\n",
-         rv_ring_count(pb), rv_get_inflight(pb),
-         (unsigned long)pb->underrun_count, rv_get_result(pb),
-         pb->eos, pb->stopped,
-         (unsigned long)pb->slots[0].done_count,
-         (unsigned long)pb->slots[0].submit_count,
-         (unsigned long)pb->slots[1].done_count,
-         (unsigned long)pb->slots[1].submit_count,
-         (unsigned long)pb->slots[2].done_count,
-         (unsigned long)pb->slots[2].submit_count,
-         (unsigned long)pb->slots[3].done_count,
-         (unsigned long)pb->slots[3].submit_count,
-         (unsigned long)pb->slots[4].done_count,
-         (unsigned long)pb->slots[4].submit_count,
-         (unsigned long)pb->slots[5].done_count,
-         (unsigned long)pb->slots[5].submit_count,
-         (unsigned long)pb->slots[6].done_count,
-         (unsigned long)pb->slots[6].submit_count,
-         (unsigned long)pb->slots[7].done_count,
-         (unsigned long)pb->slots[7].submit_count);
-
+  pb->dma_done_ms = rv_audio_now_ms();
+  rv_signal_all(pb); /* Wake a bounded producer if the DMA worker failed. */
   nxsem_post(&pb->i2s_done);
   return NULL;
 }
@@ -1195,10 +1391,9 @@ static void rv_signal_all(struct rv_playback_s *pb)
     }
 }
 
-static void rv_destroy(struct rv_playback_s *pb)
+static void rv_release_slot_buffers(struct rv_playback_s *pb)
 {
   unsigned int i;
-
   for (i = 0; i < RV_MAX_INFLIGHT; i++)
     {
       if (pb->slots[i].apb != NULL)
@@ -1207,6 +1402,35 @@ static void rv_destroy(struct rv_playback_s *pb)
           pb->slots[i].apb = NULL;
         }
 
+    }
+}
+
+static int rv_prepare_slot_buffers(struct rv_playback_s *pb, unsigned int count)
+{
+  unsigned int i;
+  rv_release_slot_buffers(pb);
+  for (i = 0; i < count; i++)
+    {
+      struct audio_buf_desc_s desc;
+      memset(&desc, 0, sizeof(desc));
+      desc.numbytes = RV_WIRE_BLOCK_BYTES;
+      desc.u.pbuffer = &pb->slots[i].apb;
+      int ret = apb_alloc(&desc);
+      if (ret < 0 || !pb->slots[i].apb)
+        {
+          rv_release_slot_buffers(pb);
+          return ret < 0 ? ret : -ENOMEM;
+        }
+    }
+  return 0;
+}
+
+static void rv_destroy(struct rv_playback_s *pb)
+{
+  unsigned int i;
+  rv_release_slot_buffers(pb);
+  for (i = 0; i < RV_MAX_INFLIGHT; i++)
+    {
       nxsem_destroy(&pb->slots[i].done);
     }
 
@@ -1222,7 +1446,8 @@ static void rv_destroy(struct rv_playback_s *pb)
 static int rv_start_i2s_playback(struct rv_playback_s *pb)
 {
   pthread_attr_t attr;
-  struct sched_param param;
+  struct ap_buffer_info_s info;
+  static const unsigned int choices[] = {16, 8, 4};
   int actual_rate;
   int actual_width;
   int ret;
@@ -1274,7 +1499,7 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
   actual_rate = (int)I2S_TXSAMPLERATE(pb->i2s, RV_WIRE_SAMPLE_RATE);
   if (actual_rate != RV_WIRE_SAMPLE_RATE)
     {
-      printf("[RV-PB] I2S wire rate request=%u actual=%d\n",
+      RV_VERBOSE("[RV-PB] I2S wire rate request=%u actual=%d\n",
              RV_WIRE_SAMPLE_RATE, actual_rate);
       ret = actual_rate < 0 ? actual_rate : -ENOTSUP;
       goto fail;
@@ -1283,35 +1508,76 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
   actual_width = (int)I2S_TXDATAWIDTH(pb->i2s, RV_WIRE_BITS);
   if (actual_width != RV_WIRE_BITS)
     {
-      printf("[RV-PB] I2S width request=%u actual=%d\n",
+      RV_VERBOSE("[RV-PB] I2S width request=%u actual=%d\n",
              RV_WIRE_BITS, actual_width);
       ret = actual_width < 0 ? actual_width : -ENOTSUP;
       goto fail;
     }
 
-  ret = I2S_IOCTL(pb->i2s, AUDIOIOC_START, 0);
-  if (ret < 0)
+  /* Include the upper APBs in the REAL allocation budget before requesting
+   * private DMA. apb_alloc can itself use internal memory on some builds.
+   * A smaller lower ring releases unused upper APBs before playback starts. */
+  ret = -ENOMEM;
+  for (unsigned int attempt = 0; attempt < sizeof(choices) / sizeof(choices[0]); attempt++)
     {
-      printf("[RV-PB] AUDIOIOC_START failed=%d\n", ret);
+      ret = rv_prepare_slot_buffers(pb, choices[attempt]);
+      if (ret == -ENOMEM) continue;
+      if (ret < 0) goto fail;
+      ret = I2S_IOCTL(pb->i2s, AUDIOIOC_START, choices[attempt]);
+      if (ret == -ENOMEM)
+        {
+          rv_release_slot_buffers(pb);
+          continue;
+        }
+      if (ret < 0) goto fail;
+      pb->i2s_started = 1;
+      memset(&info, 0, sizeof(info));
+      ret = I2S_IOCTL(pb->i2s, AUDIOIOC_GETBUFFERINFO, (unsigned long)&info);
+      if (ret < 0 || info.buffer_size != RV_WIRE_BLOCK_BYTES ||
+          (info.nbuffers != 4 && info.nbuffers != 8 && info.nbuffers != 16) ||
+          info.nbuffers > choices[attempt])
+        {
+          printf("[RV-PB] DMA contract failed rc=%d slots=%u bytes=%u requested=%u\n",
+                 ret, (unsigned int)info.nbuffers, (unsigned int)info.buffer_size,
+                 choices[attempt]);
+          ret = ret < 0 ? ret : -EPROTO;
+          goto fail_started;
+        }
+      pb->slot_count = info.nbuffers;
+      if (pb->native_media)
+        {
+          /* Prime every negotiated slot once. A large fixed startup threshold
+           * deadlocks when the Media source waits for GETPOSITION to advance. */
+          pb->start_prebuffer = pb->slot_count * RV_SOURCE_BLOCK_BYTES;
+        }
+      for (unsigned int i = pb->slot_count; i < RV_MAX_INFLIGHT; i++)
+        {
+          if (pb->slots[i].apb) apb_free(pb->slots[i].apb);
+          pb->slots[i].apb = NULL;
+        }
+      break;
+    }
+  if (!pb->i2s_started)
+    {
+      printf("[RV-PB] DMA unavailable rc=%d; minimum ring allocation failed\n", ret);
       goto fail;
     }
-
-  pb->i2s_started = 1;
+  printf("[RV-PB] DMA ready slots=%u slot_bytes=%u\n", pb->slot_count, RV_WIRE_BLOCK_BYTES);
   pb->i2s_result = 0;
   pb->state = RV_STATE_PREBUFFER;
   pb->ring_min_play = (size_t)-1;
   pb->ring_max_play = 0;
   pb->eos_silence_rounds = 0;
 
-  printf("[RV-PB] I2S ready source=%uHz/mono/%ubit "
+  RV_VERBOSE("[RV-PB] I2S ready source=%uHz/mono/%ubit "
          "wire=%dHz/%uch/%dbit mono-left "
          "source_block=%u wire_dma=%u ring_slots=%u "
          "prebuffer=%u rebuffer=%u\n",
          RV_TTS_SAMPLE_RATE, RV_TTS_BITS,
          actual_rate, RV_WIRE_CHANNELS, actual_width,
          RV_SOURCE_BLOCK_BYTES, RV_WIRE_BLOCK_BYTES,
-         RV_MAX_INFLIGHT,
-         RV_START_PREBUFFER_BYTES, RV_REBUFFER_BYTES);
+         pb->slot_count,
+         pb->start_prebuffer, RV_REBUFFER_BYTES);
 
   ret = pthread_attr_init(&attr);
   if (ret != 0)
@@ -1320,7 +1586,7 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
       goto fail_started;
     }
 
-  ret = pthread_attr_setstacksize(&attr, RV_WORKER_STACK);
+  ret = rv_thread_attributes(&attr, RV_WORKER_STACK, RV_WORKER_PRIORITY);
   if (ret != 0)
     {
       pthread_attr_destroy(&attr);
@@ -1328,10 +1594,12 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
       goto fail_started;
     }
 
-  memset(&param, 0, sizeof(param));
+#if !ROBOT_VOICE_EXPLICIT_SCHED
+  /* Match v9 exactly: best-effort parameter, inherited/default policy. */
+  struct sched_param param = {0};
   param.sched_priority = RV_WORKER_PRIORITY;
   (void)pthread_attr_setschedparam(&attr, &param);
-
+#endif
   ret = pthread_create(&pb->worker, &attr, rv_worker, pb);
   pthread_attr_destroy(&attr);
   if (ret != 0)
@@ -1346,11 +1614,11 @@ static int rv_start_i2s_playback(struct rv_playback_s *pb)
 fail_started:
   if (pb->i2s_started)
     {
-      pb->i2s_started = 0;
-      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      rv_stop_i2s(pb);
     }
 
 fail:
+  rv_release_slot_buffers(pb);
   pb->i2s = NULL;
   return ret;
 }
@@ -1358,11 +1626,12 @@ fail:
 void robot_audio_playback_set_stop_on_short_underrun(bool enable)
 {
   g_stop_on_short_underrun = enable ? 1 : 0;
-  printf("[RV-PB] short-tail policy=%s\n",
+  RV_VERBOSE("[RV-PB] short-tail policy=%s\n",
          enable ? "play-real-tail-then-stop" : "normal");
 }
 
-int robot_audio_playback_open(void)
+static int rv_playback_open(unsigned int prebuffer, bool cache_until_eos,
+                            bool voice_live, bool native_media)
 {
   struct rv_playback_s *pb = &g_pb;
   unsigned int i;
@@ -1374,7 +1643,25 @@ int robot_audio_playback_open(void)
     }
 
   memset(pb, 0, sizeof(*pb));
-  pb->stop_on_short_underrun = g_stop_on_short_underrun;
+  pb->id = ++g_playback_id;
+  pb->slot_count = RV_MAX_INFLIGHT;
+  pb->cache_until_eos = cache_until_eos;
+  pb->voice_live = voice_live;
+  pb->native_media = native_media;
+  pb->media_started = !native_media;
+  pb->ring.capacity = native_media ? RV_NATIVE_MEDIA_RING_BYTES :
+                     (voice_live ? ROBOT_VOICE_TTS_STREAM_RING_BYTES :
+                      (cache_until_eos ? RV_RING_BYTES : RV_MUSIC_RING_BYTES));
+  pb->open_ms = rv_audio_now_ms();
+  pb->input_hash = pb->output_hash = RV_PCM_HASH_INIT;
+  pb->start_prebuffer = native_media ? prebuffer :
+                        (cache_until_eos ?
+                         (RV_FULL_CACHE_AB_TEST ? RV_RING_BYTES : prebuffer) :
+                         RV_MUSIC_START_PREBUFFER_BYTES);
+  /* Complete TTS sentences use AUDIO_APB_FINAL so the lower-half drains the
+   * final real PCM and stops without walking the cyclic ring with silence. */
+  pb->stop_on_short_underrun = (cache_until_eos || voice_live || native_media) ?
+                              1 : g_stop_on_short_underrun;
 
   if (ROBOT_VOICE_TTS_RATE != RV_TTS_SAMPLE_RATE ||
       ROBOT_VOICE_CHANNELS != RV_TTS_SOURCE_CHANNELS ||
@@ -1387,11 +1674,27 @@ int robot_audio_playback_open(void)
       return -ENOTSUP;
     }
 
-  pb->ring.data = malloc(RV_RING_BYTES);
+  pb->ring.data = malloc(pb->ring.capacity);
+  if (pb->ring.data == NULL && !cache_until_eos && !voice_live &&
+      !native_media && pb->ring.capacity != RV_RING_BYTES)
+    {
+      /* Music uses PSRAM for a long jitter cushion when available. Fall back
+       * to the original bounded ring if the board has less free PSRAM. */
+      pb->ring.capacity = RV_RING_BYTES;
+      pb->start_prebuffer = RV_FULL_CACHE_AB_TEST ? RV_RING_BYTES :
+                            RV_MUSIC_START_PREBUFFER_BYTES;
+      if (pb->start_prebuffer > pb->ring.capacity)
+        {
+          pb->start_prebuffer = pb->ring.capacity;
+        }
+      pb->ring.data = malloc(pb->ring.capacity);
+      printf("[RV-PB] music ring fallback capacity=%zu prebuffer=%u\n",
+             pb->ring.capacity, pb->start_prebuffer);
+    }
   if (pb->ring.data == NULL)
     {
       printf("[RV-PB] ring alloc failed bytes=%u mode=%s\n",
-             RV_RING_BYTES,
+             (unsigned int)pb->ring.capacity,
              RV_FULL_CACHE_AB_TEST ? "full-cache" : "streaming");
       return -ENOMEM;
     }
@@ -1464,20 +1767,21 @@ int robot_audio_playback_open(void)
   pb->state = RV_STATE_PREBUFFER;
   pb->opened = 1;
 
-  /*
-   * Start the dedicated playback consumer now.  It remains in PREBUFFER until
-   * at least RV_START_PREBUFFER_BYTES of decoded PCM are available (or EOS).
-   * The TTS callback is only a producer into the ring.
-   */
-  ret = rv_start_i2s_playback(pb);
-  if (ret < 0)
+  /* Complete-cache voice needs no DMA buffers, APBs or hardware worker
+   * during the network download. Release this DRAM budget to Wi-Fi until
+   * the full validated playback window is ready at finish(). */
+  if (!(cache_until_eos && ROBOT_VOICE_TTS_CONTINUITY))
     {
-      rv_destroy(pb);
-      memset(pb, 0, sizeof(*pb));
-      return ret;
+      ret = rv_start_i2s_playback(pb);
+      if (ret < 0)
+        {
+          rv_destroy(pb);
+          memset(pb, 0, sizeof(*pb));
+          return ret;
+        }
     }
 
-  printf("[RV-DIAG] mode=%s output=%s tone_peak=%u "
+  RV_VERBOSE("[RV-DIAG] mode=%s output=%s tone_peak=%u "
          "source_bytes_per_sec=%u wire_bytes_per_sec=%u\n",
          RV_FULL_CACHE_AB_TEST ? "full-cache" : "streaming",
          RV_I2S_OUTPUT_TONE_TEST ? "tone-1khz" : "tts-pcm",
@@ -1485,12 +1789,140 @@ int robot_audio_playback_open(void)
          RV_TTS_SAMPLE_RATE * RV_TTS_SOURCE_CHANNELS *
            (RV_TTS_BITS / 8),
          RV_WIRE_SAMPLE_RATE * RV_WIRE_BYTES_PER_SAMPLE);
-  printf("[RV-PB] ring open capacity=%u start=%u rebuffer=%u "
+  RV_VERBOSE("[RV-PB] ring open capacity=%zu start=%u rebuffer=%u "
          "source=%uHz/mono/%ubit wire=%uHz/mono-left/%ubit resample=none\n",
-         RV_RING_BYTES, RV_START_PREBUFFER_BYTES, RV_REBUFFER_BYTES,
+         pb->ring.capacity, pb->start_prebuffer, RV_REBUFFER_BYTES,
          RV_TTS_SAMPLE_RATE, RV_TTS_BITS,
          RV_WIRE_SAMPLE_RATE, RV_WIRE_BITS);
+  RV_VERBOSE("[RV-PB] open id=%u mode=%s capacity=%zu cache_limit=%zu source=24000/mono16\n",
+         pb->id, cache_until_eos ? "voice-complete-cache" :
+         (voice_live ? "voice-live" : "music-stream"), pb->ring.capacity,
+         cache_until_eos ? ROBOT_VOICE_TTS_CACHE_BYTES : pb->ring.capacity);
   return 0;
+}
+
+void robot_audio_playback_set_turn_timing(unsigned long long commit_ms,
+    unsigned long long user_end_ms, unsigned long long tts_start_ms)
+{
+  struct rv_playback_s *pb = &g_pb;
+  if (!pb->opened || rv_lock(pb) < 0) return;
+  pb->commit_ms = commit_ms;
+  pb->user_end_ms = user_end_ms;
+  pb->tts_start_ms = tts_start_ms;
+  rv_unlock(pb);
+}
+
+void robot_audio_playback_set_sentence_timing(unsigned long run_id,
+    unsigned int sequence, unsigned long long ready_ms)
+{
+  struct rv_playback_s *pb = &g_pb;
+  if (!pb->opened || rv_lock(pb) < 0) return;
+  pb->run_id = run_id;
+  pb->sentence = sequence;
+  pb->tts_ready_ms = ready_ms;
+  rv_unlock(pb);
+}
+
+int robot_audio_playback_open(void)
+{
+  return rv_playback_open(RV_START_PREBUFFER_BYTES, false, false, false);
+}
+
+int robot_audio_playback_open_music(void)
+{
+  RV_VERBOSE("[RV-PB] music open prebuffer=%u ring=%u\n",
+             RV_MUSIC_START_PREBUFFER_BYTES, RV_MUSIC_RING_BYTES);
+  return rv_playback_open(RV_MUSIC_START_PREBUFFER_BYTES, false, false,
+                          false);
+}
+
+void robot_audio_playback_set_media_voice_mode(bool enable)
+{
+  g_media_voice_mode = enable;
+}
+
+int robot_audio_playback_open_media(void)
+{
+  unsigned int prebuffer = g_media_voice_mode ? ROBOT_VOICE_TTS_PREBUFFER :
+                                                RV_START_PREBUFFER_BYTES;
+
+  RV_VERBOSE("[RV-PB] media open prebuffer=%u mode=%s\n", prebuffer,
+         g_media_voice_mode ? "voice" : "music");
+
+  return rv_playback_open(prebuffer, false, false, false);
+}
+
+int robot_audio_playback_open_native_media(void)
+{
+  int ret = rv_playback_open(RV_NATIVE_MEDIA_PREBUFFER_BYTES,
+                             false, false, true);
+  if (ret == 0)
+    printf("[RV-PB] native Media buffer=%zuB (~%ums) prebuffer=%uB (~%ums) "
+           "mode=OpenVela-Media\n",
+           g_pb.ring.capacity,
+           (unsigned int)(g_pb.ring.capacity * 1000ULL /
+                          (RV_TTS_SAMPLE_RATE * sizeof(int16_t))),
+           g_pb.start_prebuffer,
+           (unsigned int)(g_pb.start_prebuffer * 1000ULL /
+                          (RV_TTS_SAMPLE_RATE * sizeof(int16_t))));
+  return ret;
+}
+
+int robot_audio_playback_start_native_media(void)
+{
+  struct rv_playback_s *pb = &g_pb;
+  if (!pb->opened || !pb->native_media) return -EINVAL;
+  if (rv_lock(pb) < 0) return -EINTR;
+  __atomic_store_n(&pb->media_started, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&pb->media_paused, false, __ATOMIC_RELEASE);
+  rv_unlock(pb);
+  nxsem_post(&pb->ring_data);
+  return 0;
+}
+
+int robot_audio_playback_pause_native_media(bool paused)
+{
+  struct rv_playback_s *pb = &g_pb;
+  if (!pb->opened || !pb->native_media) return -EINVAL;
+  if (rv_lock(pb) < 0) return -EINTR;
+  __atomic_store_n(&pb->media_paused, paused, __ATOMIC_RELEASE);
+  rv_unlock(pb);
+  nxsem_post(&pb->ring_data);
+  return 0;
+}
+
+int robot_audio_playback_end_input(void)
+{
+  struct rv_playback_s *pb = &g_pb;
+  if (!pb->opened) return -EINVAL;
+  if (rv_lock(pb) < 0) return -EINTR;
+  pb->eos = 1;
+  rv_unlock(pb);
+  rv_signal_all(pb);
+  return 0;
+}
+
+int robot_audio_playback_progress(uint64_t *completed, uint64_t *pending)
+{
+  struct rv_playback_s *pb = &g_pb;
+  int ret;
+  if (!completed || !pending || !pb->opened) return -EINVAL;
+  if (rv_lock(pb) < 0) return -EINTR;
+  *completed = pb->completed_source_bytes;
+  *pending = pb->total_written - pb->completed_source_bytes;
+  ret = pb->i2s_result;
+  rv_unlock(pb);
+  return ret < 0 ? ret : 0;
+}
+
+int robot_audio_playback_open_voice(void)
+{
+  return rv_playback_open(ROBOT_VOICE_TTS_PREBUFFER, true, false, false);
+}
+
+int robot_audio_playback_open_voice_live(void)
+{
+  return rv_playback_open(ROBOT_VOICE_TTS_PREBUFFER, false, true, false);
 }
 
 int robot_audio_playback_write(const uint8_t *pcm, size_t len)
@@ -1508,6 +1940,39 @@ int robot_audio_playback_write(const uint8_t *pcm, size_t len)
       /* PCM16 producer chunks must preserve sample alignment. */
       printf("[RV-PB] reject odd PCM chunk len=%zu\n", len);
       return -EINVAL;
+    }
+
+  if (pb->cache_until_eos)
+    {
+      size_t required;
+      int lock_ret = rv_lock(pb);
+      if (lock_ret < 0) return lock_ret;
+      if (pb->eos || pb->stopped)
+        { rv_unlock(pb); return pb->stopped ? -ECANCELED : -EPIPE; }
+      if (len > ROBOT_VOICE_TTS_CACHE_BYTES - pb->total_written)
+        {
+          rv_unlock(pb);
+          printf("[RV-PB] cache overflow id=%u incoming=%zu cached=%zu limit=%u; no audio played\n",
+                 pb->id, len, pb->total_written, ROBOT_VOICE_TTS_CACHE_BYTES);
+          return -EOVERFLOW;
+        }
+      required = pb->total_written + len;
+      if (required > pb->ring.capacity)
+        {
+          size_t capacity = pb->ring.capacity;
+          uint8_t *data;
+          while (capacity < required) capacity *= 2;
+          if (capacity > ROBOT_VOICE_TTS_CACHE_BYTES)
+            capacity = ROBOT_VOICE_TTS_CACHE_BYTES;
+          /* Voice has not consumed any PCM yet. It is contiguous from zero;
+           * restore head=count if the old capacity was exactly full. */
+          data = realloc(pb->ring.data, capacity);
+          if (!data) { rv_unlock(pb); return -ENOMEM; }
+          pb->ring.data = data;
+          pb->ring.capacity = capacity;
+          pb->ring.head = pb->ring.count;
+        }
+      rv_unlock(pb);
     }
 
   /*
@@ -1536,7 +2001,7 @@ int robot_audio_playback_write(const uint8_t *pcm, size_t len)
         }
 
       buffered = rv_ring_count(pb);
-      space = RV_RING_BYTES - buffered;
+      space = pb->ring.capacity - buffered;
       if (space < 2)
         {
           ret = nxsem_wait_uninterruptible(&pb->ring_space);
@@ -1570,10 +2035,23 @@ int robot_audio_playback_write(const uint8_t *pcm, size_t len)
         }
 
       offset += n;
-      pb->total_written += n;
     }
 
   return 0;
+}
+
+size_t robot_audio_playback_buffered_bytes(void)
+{
+  struct rv_playback_s *pb = &g_pb;
+  return pb->opened ? rv_ring_count(pb) : 0;
+}
+
+bool robot_audio_playback_music_audible(void)
+{
+  struct rv_playback_s *pb = &g_pb;
+  return pb->opened && !pb->stopped && pb->dma_start_ms != 0 &&
+         !pb->cache_until_eos && !pb->voice_live && !pb->native_media &&
+         !__atomic_load_n(&pb->music_buffering, __ATOMIC_ACQUIRE);
 }
 
 int robot_audio_playback_finish(void)
@@ -1591,13 +2069,28 @@ int robot_audio_playback_finish(void)
       return rv_get_result(pb);
     }
 
+  if (pb->cache_until_eos && ROBOT_VOICE_TTS_CONTINUITY &&
+      !pb->worker_started && !pb->stopped && pb->total_written != 0)
+    {
+      ret = rv_start_i2s_playback(pb);
+      if (ret < 0)
+        {
+          if (rv_lock(pb) == 0)
+            {
+              pb->i2s_result = ret;
+              rv_unlock(pb);
+            }
+          return ret;
+        }
+    }
+
   /*
    * Producer EOS: wake the consumer.  If less than a normal prebuffer/block
    * remains, the worker is allowed to drain that final aligned PCM tail.
    */
   pb->eos = 1;
-  printf("[RV-PB] producer EOS buffered=%zu total_pcm=%zu\n",
-         rv_ring_count(pb), pb->total_written);
+  RV_VERBOSE("[RV-PB] producer EOS id=%u mono_ms=%llu cached=%zu\n",
+         pb->id, rv_audio_now_ms(), pb->total_written);
   rv_signal_all(pb);
 
   if (pb->worker_started)
@@ -1619,40 +2112,74 @@ int robot_audio_playback_finish(void)
 
   if (pb->i2s != NULL && pb->i2s_started)
     {
-      pb->i2s_started = 0;
-      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      rv_stop_i2s(pb);
     }
 
   pb->finished = 1;
 
-  printf("[RV-PB] PLAY_DONE total_pcm=%zu expected_ms=%zu "
-         "underruns=%lu result=%d ring_min=%zu ring_max=%zu "
-         "slots=%lu/%lu,%lu/%lu,%lu/%lu,%lu/%lu,"
-         "%lu/%lu,%lu/%lu,%lu/%lu,%lu/%lu\n",
-         pb->total_written,
-         pb->total_written * 1000 /
-           (RV_TTS_SAMPLE_RATE * sizeof(int16_t)),
-         (unsigned long)pb->underrun_count,
-         ret,
-         pb->ring_min_play == (size_t)-1 ? 0 : pb->ring_min_play,
-         pb->ring_max_play,
-         (unsigned long)pb->slots[0].done_count,
-         (unsigned long)pb->slots[0].submit_count,
-         (unsigned long)pb->slots[1].done_count,
-         (unsigned long)pb->slots[1].submit_count,
-         (unsigned long)pb->slots[2].done_count,
-         (unsigned long)pb->slots[2].submit_count,
-         (unsigned long)pb->slots[3].done_count,
-         (unsigned long)pb->slots[3].submit_count,
-         (unsigned long)pb->slots[4].done_count,
-         (unsigned long)pb->slots[4].submit_count,
-         (unsigned long)pb->slots[5].done_count,
-         (unsigned long)pb->slots[5].submit_count,
-         (unsigned long)pb->slots[6].done_count,
-         (unsigned long)pb->slots[6].submit_count,
-         (unsigned long)pb->slots[7].done_count,
-         (unsigned long)pb->slots[7].submit_count);
+  if ((pb->cache_until_eos || pb->voice_live) && ret == 0 && (pb->input_hash != pb->output_hash ||
+                   pb->total_written != pb->total_read)) ret = -EPROTO;
+  if (ret < 0 && rv_lock(pb) == 0)
+    { if (pb->i2s_result >= 0) pb->i2s_result = ret; rv_unlock(pb); }
+  if (pb->voice_live && pb->sentence) {
+    RV_EVENT("[播放] run=%lu seq=%u 已完成 PCM=%zuB 补静音块=%lu 最大连续补静音块=%lu rc=%d\n",
+      pb->run_id, pb->sentence, pb->total_read, (unsigned long)pb->silence_blocks,
+      (unsigned long)pb->max_gap_run, ret);
+  } else if (pb->sentence && pb->dma_start_ms) {
+    RV_EVENT("[耗时][TTS] run=%lu seq=%u 文本送入到播放提交=%lldms 合成=%lldms 就绪后等待及提交=%lldms rc=%d\n",
+      pb->run_id, pb->sentence, rv_elapsed_ms(pb->tts_start_ms, pb->dma_start_ms),
+      rv_elapsed_ms(pb->tts_start_ms, pb->tts_ready_ms),
+      rv_elapsed_ms(pb->tts_ready_ms, pb->dma_start_ms), ret);
+  }
+
+  RV_VERBOSE("[RV-PB] PLAY_DONE id=%u pcm=%zu consumed=%zu hash=%08lx/%08lx "
+         "gap_blocks=%lu late_refills=%lu max_refill_ms=%llu max_send_ms=%llu "
+         "callback_errors=%lu callback_gap_max_ms=%llu tail_pad=%lu end_silence_blocks=%lu rc=%d\n",
+         pb->id, pb->total_written, pb->total_read,
+         (unsigned long)pb->input_hash, (unsigned long)pb->output_hash,
+         (unsigned long)pb->underrun_count, (unsigned long)pb->late_refills,
+         pb->max_refill_ms, pb->max_send_ms, (unsigned long)pb->callback_errors,
+         pb->max_callback_gap_ms, (unsigned long)pb->tail_pad_bytes, (unsigned long)pb->silence_blocks, ret);
+  RV_VERBOSE("[RV-LATENCY] playback_id=%u dma_start_ms=%llu "
+         "user_end_to_dma_ms=%llu commit_to_dma_ms=%llu tts_to_dma_ms=%llu "
+         "first_pcm_to_dma_ms=%llu source_ms=%zu play_ms=%llu producer_gap_max_ms=%llu\n",
+         pb->id, pb->dma_start_ms,
+         pb->user_end_ms && pb->dma_start_ms >= pb->user_end_ms ? pb->dma_start_ms - pb->user_end_ms : 0,
+         pb->commit_ms && pb->dma_start_ms >= pb->commit_ms ? pb->dma_start_ms - pb->commit_ms : 0,
+         pb->tts_start_ms && pb->dma_start_ms >= pb->tts_start_ms ? pb->dma_start_ms - pb->tts_start_ms : 0,
+         pb->first_pcm_ms && pb->dma_start_ms >= pb->first_pcm_ms ? pb->dma_start_ms - pb->first_pcm_ms : 0,
+         pb->total_written * 1000 / (RV_TTS_SAMPLE_RATE * sizeof(int16_t)),
+         pb->dma_start_ms && pb->dma_done_ms >= pb->dma_start_ms ? pb->dma_done_ms - pb->dma_start_ms : 0,
+         pb->max_pcm_gap_ms);
+  if (!pb->voice_live)
+    {
+      printf("[RV-PB] stream summary id=%u prebuffer=%u low_water=%zu "
+             "underruns=%lu silence_blocks=%lu producer_gap_max_ms=%llu\n",
+             pb->id, pb->start_prebuffer, pb->ring_min_play,
+             (unsigned long)pb->underrun_count,
+             (unsigned long)pb->silence_blocks, pb->max_pcm_gap_ms);
+    }
   return ret;
+}
+
+uint64_t robot_audio_playback_cancel(void)
+{
+  struct rv_playback_s *pb = &g_pb;
+  uint64_t completed = 0;
+  if (!pb->opened) return 0;
+  pb->stopped = 1;
+  rv_signal_all(pb);
+  if (pb->i2s != NULL && pb->i2s_started)
+    {
+      rv_stop_i2s(pb);
+      rv_signal_all(pb);
+    }
+  if (rv_lock(pb) >= 0)
+    {
+      completed = pb->completed_source_bytes;
+      rv_unlock(pb);
+    }
+  return completed;
 }
 
 void robot_audio_playback_close(void)
@@ -1671,8 +2198,7 @@ void robot_audio_playback_close(void)
 
       if (pb->i2s != NULL && pb->i2s_started)
         {
-          pb->i2s_started = 0;
-          I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+          rv_stop_i2s(pb);
           rv_signal_all(pb);
         }
 
@@ -1684,33 +2210,12 @@ void robot_audio_playback_close(void)
 
   if (pb->i2s != NULL && pb->i2s_started)
     {
-      pb->i2s_started = 0;
-      I2S_IOCTL(pb->i2s, AUDIOIOC_STOP, 0);
+      rv_stop_i2s(pb);
     }
 
-  printf("[RV-PB] close total_pcm=%zu finished=%d underruns=%lu result=%d "
-         "slots=%lu/%lu,%lu/%lu,%lu/%lu,%lu/%lu,"
-         "%lu/%lu,%lu/%lu,%lu/%lu,%lu/%lu\n",
-         pb->total_written, pb->finished,
-         (unsigned long)pb->underrun_count,
-         rv_get_result(pb),
-         (unsigned long)pb->slots[0].done_count,
-         (unsigned long)pb->slots[0].submit_count,
-         (unsigned long)pb->slots[1].done_count,
-         (unsigned long)pb->slots[1].submit_count,
-         (unsigned long)pb->slots[2].done_count,
-         (unsigned long)pb->slots[2].submit_count,
-         (unsigned long)pb->slots[3].done_count,
-         (unsigned long)pb->slots[3].submit_count,
-         (unsigned long)pb->slots[4].done_count,
-         (unsigned long)pb->slots[4].submit_count,
-         (unsigned long)pb->slots[5].done_count,
-         (unsigned long)pb->slots[5].submit_count,
-         (unsigned long)pb->slots[6].done_count,
-         (unsigned long)pb->slots[6].submit_count,
-         (unsigned long)pb->slots[7].done_count,
-         (unsigned long)pb->slots[7].submit_count);
-
+  if (!pb->finished)
+    RV_VERBOSE("[RV-PB] cancelled id=%u cached=%zu consumed=%zu dma_start_ms=%llu result=%d\n",
+           pb->id, pb->total_written, pb->total_read, pb->dma_start_ms, rv_get_result(pb));
   rv_destroy(pb);
   memset(pb, 0, sizeof(*pb));
 }

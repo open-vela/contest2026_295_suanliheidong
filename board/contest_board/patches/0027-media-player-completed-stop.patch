@@ -1,0 +1,29 @@
+diff --git a/server/media_player.c b/server/media_player.c
+--- a/server/media_player.c
++++ b/server/media_player.c
+@@ -1177,8 +1177,24 @@ static int media_player_stop(MediaPlayerContext* ctx)
+ {
++    bool audio_active;
++    bool completed;
++
+     if (ctx->state == MEDIA_PLAYER_STATE_STOPPED)
+         return 0;
+ 
++    /* A completed stream has already propagated EOF through the audio
++     * graph. Unlinking it again races the FFmpeg link status and can trip
++     * av_assert0(!li->status_in). Closing the demuxer and releasing the
++     * graph owner is sufficient for this state. */
++    completed = ctx->state == MEDIA_PLAYER_STATE_COMPLETED;
++    pthread_mutex_lock(&ctx->mutex);
++    audio_active = ctx->audio_output_state != 0;
++    /* The unlink callback clears this state after the graph has detached.
++     * Claim it before queueing a stop so a later cleanup cannot unlink the
++     * same FFmpeg link a second time. */
++    if (audio_active)
++        ctx->audio_output_state = 0;
++    pthread_mutex_unlock(&ctx->mutex);
+     media_player_clear_queue(ctx, MEDIA_PLAYER_DATA_QUEUE_IDX);
+ 
+-    if (ctx->audio_output && ctx->audio_stream)
++    if (!completed && audio_active && ctx->audio_output && ctx->audio_stream)
+         audio_graph_stop(ctx->audio_output);
